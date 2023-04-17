@@ -1,0 +1,10 @@
+A list of features to be added.
+
+- Build flags, AVX and non-avx flags.
+- Reduce memory footprint.
+- Implement multithreaded ops.
+- Allow multiple args: temp, sampler, etc.
+- Aggresive error checking.
+- Testing.
+- Provide simple logging functions.
+- Allow generation of arbitrary-length string.
