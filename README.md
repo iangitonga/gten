@@ -11,7 +11,7 @@ multithreading, int8 quantization and FP32 inference.
 ```
 git clone https://github.com/iangitonga/gten.git
 cd gten
-g++ -O3 -ffast-math tensor.cpp modules.cpp gpt2.cpp -o gpt2
+g++ -std=c++17 -O3 -ffast-math tensor.cpp modules.cpp gpt2.cpp -o gpt2
 ./gpt2 -p "Once upon a time"
 ```
 
@@ -19,6 +19,6 @@ If you have an Intel CPU that supports AVX, run:
 ```
 git clone https://github.com/iangitonga/gten.git
 cd gten
-g++ -O3 -ffast-math -mavx tensor.cpp modules.cpp gpt2.cpp -o gpt2
+g++ -std=c++17 -O3 -ffast-math -mavx tensor.cpp modules.cpp gpt2.cpp -o gpt2
 ./gpt2 -p "Once upon a time"
 ```

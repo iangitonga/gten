@@ -679,7 +679,7 @@ void GPT2::show_performance() const
 
 void GPT2::sample(const std::string &prompt, double temp, int max_iter)
 {
-    GTEN_CHECK(max_iter < config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %ld.\n", max_iter, config_.n_ctx);
+    GTEN_CHECK(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %ld.\n", max_iter, config_.n_ctx);
 
     time_sample_ms_ = 0;  // Reset for each call.
     niter_ = 0;
