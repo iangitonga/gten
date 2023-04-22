@@ -16,7 +16,7 @@ def show_progress(cur_size, max_size):
     prog = int(cur_size / max_size * 50)
     for i in range(prog):
         ls[i] = "#"
-    print("Progress: [" + "".join(ls) + "]", end="\r")
+    print("Progress: [" + "".join(ls) + "]", end="\r", flush=True)
     if cur_size == max_size:
         print()
 
