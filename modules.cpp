@@ -12,7 +12,6 @@
 #if USE_AVX
 #include <immintrin.h>
 #endif
-S
 
 namespace gten
 {

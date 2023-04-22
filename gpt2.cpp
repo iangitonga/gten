@@ -122,7 +122,7 @@ void GPT2::sample(const std::string &prompt, double temp, int max_iter)
         for (int j = 0; j < logits_size; ++j)
             logits_probs.push_back(std::make_pair((double)logits_data[j] / temp, j));
 
-        const int top_k = 16;
+        const int top_k = 40;
         
         // Select top k elements.
         std::partial_sort(
