@@ -2,7 +2,6 @@
 
 
 #include "tensor.h"
-#include "tokenizer.h"
 
 #include <chrono>
 #include <iostream>
@@ -32,12 +31,23 @@ private:
     bool stopped_ = false;
 };
 
+/// Provides an embedding table lookup for tokens.
 class Embedding
 {
 public:
     Embedding() {}
-    Embedding(const Tensor &weight, const uint32_t n_vocab, const uint32_t max_ctx, const uint32_t n_embed);
+
+    /// Construct an embedding table from the given weight. The weight should be of shape
+    /// (n_vocab, n_embed).
+    Embedding(const Tensor &weight, uint32_t max_ctx);
+
+    /// Returns the embeddings of the given tokens. The input tensor must be of shape
+    /// (n_ctx,) and the output tensor is of shape (n_ctx, n_embed).
     Tensor forward(const Tensor& tokens);
+
+    /// Performs matrix mul between the input and the weights tensor. The input tensor
+    /// is expected to have shape (n_ctx, n_embed) and the output has shape (1, n_vocab)
+    /// which represents the prob dist of the next predicted token given the context.
     Tensor forward_project(const Tensor &inp);
     int64_t emb_time() const { return time_embed_ms_; }
     int64_t emb_proj_time() const { return time_project_ms_; }
@@ -45,6 +55,7 @@ public:
 private:
     uint32_t n_vocab_;
     uint32_t n_embed_;
+    uint32_t max_ctx_;
     Tensor weight_;
     Tensor emb_out_;
     Tensor proj_out_;
@@ -55,13 +66,19 @@ private:
     int64_t time_project_ms_ = 0;
 };
 
-
+/// Provides a positional embedding table lookup for tokens.
 class PosEmbedding
 {
 public:
     PosEmbedding() {}
-    PosEmbedding(const Tensor &weight, const uint32_t max_ctx, const uint32_t n_embed);
-    Tensor forward(const uint32_t n_ctx);
+
+    /// Construct a positional embedding table from the given weight. The weight should be
+    /// of shape (max_ctx, n_embed).
+    PosEmbedding(const Tensor &weight, uint32_t max_ctx);
+
+    /// Return the positional embeddings of the given number of tokens. The number of
+    /// tokens must not exceed max_ctx.
+    Tensor forward(uint32_t n_ctx);
     int64_t time() const { return time_ms_; }
     
 private:
@@ -74,21 +91,25 @@ private:
     int64_t time_ms_ = 0;
 };
 
-// Normalizes each vector in the given sequence of vector independently.
 class LayerNorm
 {
 public:
     LayerNorm() {}
-    LayerNorm(const Tensor &weight, const Tensor &bias, const uint32_t max_ctx, const uint32_t n_embed);
+
+    /// Construct affine layer-norm from the given weight and bias. The weight and bias
+    /// should be of shape (n_embed,).
+    LayerNorm(const Tensor &weight, const Tensor &bias, uint32_t max_ctx);
+
+    /// Normalize the input. Both input and output are of shape (n_ctx, n_embed). n_ctx
+    /// must not exceed max_ctx.
     Tensor forward(const Tensor &inp);
     int64_t time() const { return time_ms_; }
 
 private:
     uint32_t n_embed_;
-    // A float tensor of shape (n_embed,)
     Tensor weight_;
-    // A float tensor of shape (n_embed,)
     Tensor bias_;
+    uint32_t max_ctx_;
     float eps_ = 1e-05f;
 
     Tensor out_;
@@ -100,7 +121,7 @@ class Residual
 {
 public:
     Residual() {}
-    Residual(const uint32_t max_ctx, const uint32_t n_embed);
+    Residual(uint32_t max_ctx, uint32_t n_embed);
     Tensor forward(const Tensor &inp0, const Tensor &inp1);
     int64_t time() const { return time_ms_; }
 
@@ -114,7 +135,7 @@ class GELU
 {
 public:
     GELU() {};
-    GELU(const uint32_t max_ctx, const uint32_t n_out);
+    GELU(uint32_t max_ctx, uint32_t n_out);
     Tensor forward(const Tensor &inp);
     int64_t time() const { return time_ms_; }
 
@@ -131,7 +152,10 @@ class Linear
 {
 public:
     Linear() {}
-    Linear(const Tensor &weight, const Tensor &bias, const uint32_t max_ctx);
+
+    /// Construct linear layer from the given weight and bias. The weight should be of
+    /// shape (n_out, n_embed) and bias (n_out).
+    Linear(const Tensor &weight, const Tensor &bias, uint32_t max_ctx);
     Tensor forward(const Tensor &inp);
     int64_t time() const { return time_ms_; }
 
@@ -147,8 +171,11 @@ class MultiHeadSelfAttn
 {
 public:
     MultiHeadSelfAttn() {}
+
+    /// Construct self-attn layer from the given weights. query, key and value should be
+    /// of shape (n_embed, n_head x d_head). out_proj of shape (n_head x d_head, n_embed).
     MultiHeadSelfAttn(const Linear &query, const Linear &key, const Linear &value, const Linear &out_proj,
-                      const uint32_t max_ctx, const uint32_t n_embed);
+                      uint32_t max_ctx, uint32_t n_embed, uint32_t n_head);
     Tensor forward(const Tensor &inp);
     int64_t time_linear() const { return query_.time() + key_.time() + value_.time() + out_proj_.time(); }
     int64_t time_attn() const { return time_attn_ms_; }
@@ -158,13 +185,14 @@ private:
     Linear key_;
     Linear value_;
     Linear out_proj_;
+    uint32_t n_head_;
 
     Tensor qk_cache_;
     Tensor qkv_cache_;
     bool qkv_cached_ = false;
     int64_t time_attn_ms_ = 0;
 
-    Tensor qkv_attn(const Tensor &q, const Tensor &k, const Tensor &v, const uint32_t n_head);
+    Tensor qkv_attn(const Tensor &q, const Tensor &k, const Tensor &v);
 };
 
 
@@ -174,7 +202,7 @@ public:
     ResidualAttentionBlock() {}
     ResidualAttentionBlock(const MultiHeadSelfAttn &attn, const LayerNorm &ln_1, const Linear &mlp_fc,
                            const Linear &mlp_proj, const LayerNorm &ln_2, const GELU &gelu,
-                           const uint32_t max_ctx, const uint32_t n_embed);
+                           uint32_t max_ctx, uint32_t n_embed);
     Tensor forward(const Tensor &inp);
     int64_t time_linear() const { return attn_.time_linear() + mlp_fc_.time() + mlp_proj_.time(); }
     int64_t time_proj() const { return mlp_fc_.time() + mlp_proj_.time(); }
@@ -193,54 +221,6 @@ private:
     GELU gelu_;
     Residual inp_res_;
     Residual attn_res_;
-};
-
-
-struct GPT2Config
-{
-    int64_t n_vocab;
-    int64_t n_ctx;
-    int64_t n_embed;
-    int64_t n_layer;
-    int64_t n_head;
-
-    friend std::ostream& operator<<(std::ostream& stream, const GPT2Config& config)
-    {
-        stream << "GPT2Config(n_vocab=" << config.n_vocab
-               << ", n_ctx="   << config.n_ctx
-               << ", n_embed=" << config.n_embed
-               << ", n_layer=" << config.n_layer
-               << ", n_head="  << config.n_head
-               << ")\n";
-        return stream;
-    }
-};
-
-
-class GPT2
-{
-public:
-    GPT2Tokenizer tokenizer;
-
-    GPT2(const std::string &fname);
-    Tensor logits(const Tensor &inp);
-    void show_performance() const;
-    void sample(const std::string &prompt, double temp = 1.0, int max_iter = 1024);
-
-private:
-    const int64_t magic_number_ = 0x454c49464e455447;
-    GPT2Config config_;
-
-    Embedding wte_;
-    PosEmbedding wpe_;
-    std::vector<ResidualAttentionBlock> blocks_;
-    LayerNorm ln_f_;
-    Residual res_;
-
-    int64_t time_sample_ms_ = 0;
-    int64_t niter_ = 0;
-    
-    void load_from_file(const std::string &fname);
 };
 
 } // namespace gten
