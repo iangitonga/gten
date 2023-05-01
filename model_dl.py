@@ -5,15 +5,15 @@ import sys
 from urllib import request
 
 
-MODELS = ("GPT-2-117M", "GPT-2-345M", "GPT-2-762M")
+MODELS = ("Gpt2", "Gpt2-medium", "Gpt2-large")
 
 MODELS_URLS = {
-    "GPT-2-117M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-117M.fp32.gten",
-    "GPT-2-345M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-345M.fp32.gten",
-    "GPT-2-762M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-762M.fp32.gten",
-    "GPT-2-117M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-117M.fp16.gten",
-    "GPT-2-345M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-345M.fp16.gten",
-    "GPT-2-762M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-762M.fp16.gten",
+    "Gpt2.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2.fp32.gten",
+    "Gpt2.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2.fp16.gten",
+    "Gpt2-medium.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-medium.fp32.gten",
+    "Gpt2-medium.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-medium.fp16.gten",
+    "Gpt2-large.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-large.fp32.gten",
+    "Gpt2-large.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-large.fp16.gten",
 }
 
 
@@ -53,7 +53,7 @@ def download_model(model_name, inference_mode):
 if len(sys.argv) < 3 or sys.argv[1] not in MODELS:
     print("Model not specified.\n")
     print("usage: model_registry.py MODEL INFERENCE_MODE")
-    print("MODEL is one of (GPT-2-117M, GPT-2-345M, GPT-2-762M)")
+    print("MODEL is one of (Gpt2, Gpt2-medium, Gpt2-large)")
     print("INFERENCE_MODE is one of (f16, f32)")
 
 

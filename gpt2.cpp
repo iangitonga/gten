@@ -34,7 +34,7 @@ int main(int argc, char const *argv[])
 		return -1;
     }
     std::string prompt = "";
-    std::string model_name = "GPT-2-345M";
+    std::string model_name = "Gpt2-medium";
     std::string inference_mode = "f16";
     double temperature = 0.9;
     for (int i = 1; i < argc; i++)
@@ -49,10 +49,10 @@ int main(int argc, char const *argv[])
             i += 1;
         }
         else if (arg == "-sm") {
-            model_name = "GPT-2-117M";
+            model_name = "Gpt2";
         }
         else if (arg == "-lg") {
-            model_name = "GPT-2-762M";
+            model_name = "Gpt2-large";
         }
         else if (arg == "-f32") {
             inference_mode = "f32";
