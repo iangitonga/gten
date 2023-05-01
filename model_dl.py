@@ -32,21 +32,25 @@ def _download_model(url, model_path):
             output.write(buffer)
             show_progress(len(buffer), download_size)
 
-def download_model(model_name):
-    model_path = os.path.join("models", f"{model_name}.gten")
+def download_model(model_name, inference_mode):
+    if inference_mode == "f16":
+        model_path = os.path.join("models", f"{model_name}.fp16.gten")
+    else:
+        model_path = os.path.join("models", f"{model_name}.fp32.gten")
     if os.path.exists(model_path):
         return
     os.makedirs("models", exist_ok=True)
     _download_model(MODELS[model_name], model_path)
 
 
-if len(sys.argv) < 2 or sys.argv[1] not in MODELS:
+if len(sys.argv) < 3 or sys.argv[1] not in MODELS:
     print("Model not specified.\n")
-    print("usage: model_registry.py MODEL")
+    print("usage: model_registry.py MODEL INFERENCE_MODE")
     print("MODEL is one of (GPT-2-117M, GPT-2-345M, GPT-2-762M)")
+    print("INFERENCE_MODE is one of (f16, f32)")
 
 
 try:
-    download_model(sys.argv[1])
+    download_model(sys.argv[1], sys.argv[2])
 except:
     exit(-2)

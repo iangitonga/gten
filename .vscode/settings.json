@@ -34,6 +34,9 @@
         "tuple": "cpp",
         "type_traits": "cpp",
         "typeinfo": "cpp",
-        "utility": "cpp"
+        "utility": "cpp",
+        "cerrno": "cpp",
+        "iterator": "cpp",
+        "variant": "cpp"
     }
 }

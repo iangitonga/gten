@@ -115,7 +115,7 @@ class Transformer(nn.Module):
 
 GTEN_MAGIC_NUMBER = 0x454c49464e455447
 BYTEORDER = "little"
-FLOAT_SIZE = 4
+
 
 def itob(integer):
     return int.to_bytes(integer, 8, BYTEORDER)
@@ -123,12 +123,24 @@ def itob(integer):
 def btoi(bytes_):
     return int.from_bytes(bytes_, BYTEORDER)
 
+def tensor_to_file(tensor, file_obj, fpsize, expected_size):
+    assert (fpsize == 2 or fpsize == 4), f"Unsupported datasize: {fpsize}"
+    tensor = tensor.flatten().to(torch.float16) if fpsize == 2 else tensor.flatten().to(torch.float32)
+    # A list of bytes as integers.
+    tensor_bytes = tensor.detach().numpy().tobytes()
+    assert len(tensor_bytes) == expected_size
+    file_obj.write(itob(len(tensor_bytes)))
+    # byteorder issue?
+    file_obj.write(tensor_bytes)
 
-def test_converted(fname, model):
+
+def test_converted(fname, model, dtype_size):
     print(f"Testing conversion of: {fname}")
     with open(fname, "rb") as f:
         magic = f.read(8)
         assert btoi(magic) == GTEN_MAGIC_NUMBER
+        _dtype_size = f.read(8)
+        assert btoi(_dtype_size) == dtype_size
         n_vocab = f.read(8)
         assert btoi(n_vocab) == model.config.n_vocab
         n_ctx = f.read(8)
@@ -152,7 +164,12 @@ def test_converted(fname, model):
     print("Testing successfull!!!")
 
 
-def write_block(f, model, block_idx):
+def write_block(file_obj, model, weights_dtype, dtype_size, block_idx):
+    segment_name = f"block_{block_idx}".encode()
+    segment_name_size = len(segment_name)
+    file_obj.write(itob(segment_name_size))
+    file_obj.write(segment_name)
+
     h = model.h[block_idx]
     attn_qw, attn_kw, attn_vw = h.attn.c_attn.weight.split(model.config.n_state, dim=0)
     attn_qb, attn_kb, attn_vb = h.attn.c_attn.bias.split(model.config.n_state, dim=0)
@@ -166,33 +183,21 @@ def write_block(f, model, block_idx):
     mlp_pb = h.mlp.c_proj.bias
     ln_2w = h.ln_2.weight
     ln_2b = h.ln_2.bias
-    params_list = [attn_qw, attn_qb, attn_kw, attn_kb, attn_vw, attn_vb, attn_pw, attn_pb,
+    block_tensors = [attn_qw, attn_qb, attn_kw, attn_kb, attn_vw, attn_vb, attn_pw, attn_pb,
                    ln_1w, ln_1b, mlp_fcw, mlp_fcb, mlp_pw, mlp_pb, ln_2w, ln_2b]
-    
-    weight_lists = []
-    for weight in params_list:
-        weight_lists.extend(weight.flatten().tolist())
-        
-    segment_data = array.array("f")
-    segment_data.fromlist(weight_lists)
-    segment_data = segment_data.tobytes()
-    
-    expected_size = (12 * model.config.n_state * model.config.n_state + 13 * model.config.n_state) * FLOAT_SIZE
-    segment_size = len(segment_data)
-    assert segment_size == expected_size, f"Block {block_idx}: expected={expected_size}, real={segment_size}"
-    
-    segment_name = f"block_{block_idx}".encode()
-    segment_name_size = len(segment_name)
-    f.write(itob(segment_name_size))
-    f.write(segment_name)
-    f.write(itob(segment_size))
-    f.write(segment_data)
+    block_tensors = [t.flatten() for t in block_tensors]
+    combined_tensors = torch.cat(block_tensors, dim=0)
+    expected_size = (12 * model.config.n_state * model.config.n_state + 13 * model.config.n_state) * dtype_size
+    tensor_to_file(combined_tensors, file_obj, dtype_size, expected_size)
 
-def convert_model_to_gten(model, model_name, vocab_fname):
-    model_fname = f"{model_name}.gten"
-    print("Cnverting ...")
+def convert_model_to_gten(model, model_name, vocab_fname, weights_dtype):
+    DTYPE_SIZE = 2 if weights_dtype == torch.float16 else 4
+
+    model_fname = f"{model_name}.fp16.gten" if weights_dtype == torch.float16 else f"{model_name}.fp32.gten"
+    print("Converting ...")
     with open(model_fname, "wb") as f:
         f.write(itob(GTEN_MAGIC_NUMBER))
+        f.write(itob(DTYPE_SIZE))
         f.write(itob(model.config.n_vocab))
         f.write(itob(model.config.n_ctx))
         f.write(itob(model.config.n_state))
@@ -215,57 +220,40 @@ def convert_model_to_gten(model, model_name, vocab_fname):
         print("Writing wte")
         segment_name = b"wte"
         segment_name_size = len(segment_name)
-        segment_data = array.array("f")
-        segment_data.fromlist(model.wte.weight.flatten().tolist())
-        segment_data = segment_data.tobytes()
-        segment_size = len(segment_data)
-        expected_size = model.config.n_vocab * model.config.n_state * FLOAT_SIZE
-        assert segment_size == expected_size, f"wte: expected={expected_size}, real={segment_size}"
         f.write(itob(segment_name_size))
         f.write(segment_name)
-        f.write(itob(segment_size))
-        f.write(segment_data)
+        expected_size = model.config.n_vocab * model.config.n_state * DTYPE_SIZE
+        tensor_to_file(model.wte.weight, f, DTYPE_SIZE, expected_size)
         
         print("Writing wpe")
         segment_name = b"wpe"
         segment_name_size = len(segment_name)
-        segment_data = array.array("f")
-        segment_data.fromlist(model.wpe.weight.flatten().tolist())
-        segment_data = segment_data.tobytes()
-        segment_size = len(segment_data)
-        expected_size = model.config.n_ctx * model.config.n_state * FLOAT_SIZE
-        assert segment_size == expected_size, f"wpe: expected={expected_size}, real={segment_size}"
         f.write(itob(segment_name_size))
         f.write(segment_name)
-        f.write(itob(segment_size))
-        f.write(segment_data)
+        expected_size = model.config.n_ctx * model.config.n_state * DTYPE_SIZE
+        tensor_to_file(model.wpe.weight, f, DTYPE_SIZE, expected_size)
         
         for i in range(model.config.n_layer):
             print(f"Writing block_{i}")
-            write_block(f, model, i)
+            write_block(f, model, weights_dtype, DTYPE_SIZE, i)
         
         print("Writing ln_f")
         segment_name = b"ln_f"
         segment_name_size = len(segment_name)
-        segment_data = array.array("f")
-        segment_data.fromlist(model.ln_f.weight.flatten().tolist() + model.ln_f.bias.flatten().tolist())
-        segment_data = segment_data.tobytes()
-        segment_size = len(segment_data)
-        expected_size = model.config.n_state * 2 * FLOAT_SIZE
-        assert segment_size == expected_size, f"ln_f: expected={expected_size}, real={segment_size}"
         f.write(itob(segment_name_size))
         f.write(segment_name)
-        f.write(itob(segment_size))
-        f.write(segment_data)
+        expected_size = model.config.n_state * 2 * DTYPE_SIZE
+        combined_data = torch.cat((model.ln_f.weight.flatten(), model.ln_f.bias.flatten()), dim=0)
+        tensor_to_file(combined_data, f, DTYPE_SIZE, expected_size)
 
-        # A little sanity check.
-        test_converted(model_fname, model)
+    # A little sanity check.
+    test_converted(model_fname, model, DTYPE_SIZE)
 
 
 # Upload vocab fname[down].
 # Download model.
 
-def download(model_name, url, vocab_url):
+def download_model(model_name, url):
     model_path = f"{model_name}"
 
     print(f"Downloading {model_name}")
@@ -278,10 +266,12 @@ def download(model_name, url, vocab_url):
 
                 output.write(buffer)
                 loop.update(len(buffer))
+    return model_path
 
+def download_vocab(url):
     print("Downloading vocab")
     vocab_path = "gpt2_vocab.bin"
-    with urllib.request.urlopen(vocab_url) as source, open(vocab_path, "wb") as output:
+    with urllib.request.urlopen(url) as source, open(vocab_path, "wb") as output:
         with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True, unit_divisor=1024) as loop:
             while True:
                 buffer = source.read(8192)
@@ -291,7 +281,7 @@ def download(model_name, url, vocab_url):
                 output.write(buffer)
                 loop.update(len(buffer))
 
-    return model_path, vocab_path
+    return vocab_path
 
 
 VOCAB_URL = "https://huggingface.co/iangitonga/gten/resolve/main/gpt-2-vocab.gten"
@@ -311,17 +301,27 @@ MODEL_CONFIG = {
 }
 
 
-def download_and_convert(model_name):
-    model_path, vocab_path = download(model_name, MODEL_URL[model_name], VOCAB_URL)
+def download_and_convert(model_name, dtype, model_path, vocab_path):
+    weights_dtype = torch.float16 if dtype == "fp16" else torch.float32
+    print(F"Converting to dtype: {dtype}[{weights_dtype}]")
+
+    if not model_path:
+        model_path = download_model(model_name, MODEL_URL[model_name])
+    if not vocab_path:
+        vocab_path = download_vocab(VOCAB_URL)
     model = Transformer.from_pretrained(model_path, MODEL_CONFIG[model_name])
-    convert_model_to_gten(model, model_name, vocab_path)
-    os.remove(model_path)
-    os.remove(vocab_path)
+    convert_model_to_gten(model, model_name, vocab_path, weights_dtype)
+    # os.remove(model_path)
+    # os.remove(vocab_path)
     print("Conversion complete!!!")
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model", help="Model name to be converted.", choices=MODEL_CONFIG.keys())
+parser.add_argument("dtype", help="Weights dtype.", choices=("fp32", "fp16"))
+parser.add_argument("--mpath", help="Optional path to source model to avoid download.")
+parser.add_argument("--vpath", help="Optional path to vocab to avoid download.")
+
 args = parser.parse_args()
 
-download_and_convert(args.model)
+download_and_convert(args.model, args.dtype, args.mpath, args.vpath)

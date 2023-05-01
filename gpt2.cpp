@@ -1,27 +1,30 @@
-#include "gpt2.h"
-
-#include <iostream>
-#include <string_view>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <string>
+#include <string_view>
 #include <random>
+
+#include "gpt2.h"
 
 
 
 const char *usage = R"(
-usage: gpt2 [options] PROMPT
+usage: gpt2 [options] -p PROMPT
 
-Options and arguments.
--sm : use small model (117M) for inference.
--md : Use medium model (345M) for inference. This model is chosen by default.
--lg : Use large model (762M) for inference.
+Optional args.
+-sm :      Use small model (117M) for inference.
+-md :      Use medium model (345M) for inference. This model is chosen by default.
+-lg :      Use large model (762M) for inference.
+-f32:      Use 32-bit floating point values for inference. Default is f16.
+--temp T : Temperature to use during sampling. Default is 0.9. It must be greater than 0. 
 
 Examples:
-  ./gpt2 "Once upon a time" 
-  ./gpt2 -lg "Once upon a time"
+  ./gpt2 -p "Once upon a time" 
+  ./gpt2 -lg -p "Once upon a time"
+  ./gpt2 -lg --temp 0.5 -p "Once upon a time"
 )";
-
 
 int main(int argc, char const *argv[])
 {
@@ -30,14 +33,53 @@ int main(int argc, char const *argv[])
 		std::cout << usage << "\n";
 		return -1;
     }
-    std::string model_name = "GPT-2-345M";
     std::string prompt = "";
+    std::string model_name = "GPT-2-345M";
+    std::string inference_mode = "f16";
+    double temperature = 0.9;
     for (int i = 1; i < argc; i++)
     {
         std::string_view arg(argv[i]);
-        if (arg == "-sm") model_name = "GPT-2-117M";
-        else if (arg == "-lg") model_name = "GPT-2-762M";
-        else prompt = arg;
+        if (arg == "-p") {
+            if (argc <= i+1) {
+                std::cout << "Prompt is missing.\n";
+                return -1;
+            }
+            prompt = argv[i+1];
+            i += 1;
+        }
+        else if (arg == "-sm") {
+            model_name = "GPT-2-117M";
+        }
+        else if (arg == "-lg") {
+            model_name = "GPT-2-762M";
+        }
+        else if (arg == "-f32") {
+            inference_mode = "f32";
+        }
+        else if (arg == "--temp") {
+            if (argc <= i+1) {
+                std::cout << "Temp value is missing.\n";
+                return -1;
+            }
+            double temp;
+            try {
+                temp = std::stod(argv[i+1]);
+            } catch (...) {
+                std::cout << "Invalid temp value.\n";
+                return -1;
+            }
+            if (temp <= 0.0f) {
+                std::cout << "Temp value must be greater than zero.\n";
+                return -1;
+            }
+            temperature = temp;
+            i += 1; // skip parsed temp.
+        }
+        else {
+            std::cout << "Unknown option: " << arg << "\n";
+            return -1;
+        }
     }
     if (prompt == "") {
         std::cout << "Prompt is not provided.\n";
@@ -46,20 +88,23 @@ int main(int argc, char const *argv[])
     }
 
 #if defined(__WIN32__) || defined(_WIN32) || defined(WIN32) || defined(__CYGWIN__) || defined(__MINGW32__)
-    std::string command = std::string("python model_dl.py ") + model_name;
+    std::string command = std::string("python model_dl.py ") + model_name + " " + inference_mode;
 #else
-    std::string command = std::string("python3 model_dl.py ") + model_name;
+    std::string command = std::string("python3 model_dl.py ") + model_name + " " + inference_mode;
 #endif
     int res = std::system(command.c_str());
     if (res != 0) {
-        std::cout << "Error: Failed to download model due to network issues.\n";
+        std::cout << "Error: Failed to download " << model_name << " model due to network issues.\n";
         return -1;
     }
 
-    std::string model_dir = std::string("models/") + model_name + ".gten";
+    std::string model_dir = std::string("models/") + model_name + ".fp16.gten";;
+    if (inference_mode == "f32")
+        model_dir = std::string("models/") + model_name + ".fp32.gten";
+
     GPT2 model(model_dir);
 
-    model.sample(prompt, 0.9, 1000);
+    model.sample(prompt, temperature, 1000);
 
     return 0;
 }
@@ -79,18 +124,69 @@ gten::Tensor GPT2::logits(const gten::Tensor &inp)
 {
     gten::Tensor logits;
 
-    logits = res_.forward(wte_.forward(inp), wpe_.forward(inp.shape()[0]));
+    // std::cerr << wte_.forward(inp) << "\n";
+
+    logits = res_.forward(wte_.forward(inp), wpe_.forward(inp.size(0)));
     for (auto &block : blocks_)
         logits = block.forward(logits);
     logits = ln_f_.forward(logits);
-    logits = wte_.forward_project(logits);
+    logits = wte_.forward_proj(logits);
 
     return logits;
 }
 
+void GPT2::greedy_sample(const std::string &prompt, double temp, int max_iter)
+{
+    GTEN_ASSERT(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %d.\n", max_iter, config_.n_ctx);
+
+    time_sample_ms_ = 0;
+
+
+    std::vector<int32_t> tokens = tokenizer.encode(prompt);
+    tokens.reserve(max_iter);
+    gten::Tensor logits;
+    const int logits_size = 50257;
+
+    const int eot_token = 50256;
+    const int initial_pos = tokens.size() - 1;
+    const int n_iter = max_iter - tokens.size();
+    int64_t niter = 0;
+    // Use cerr because it is unbuffered.
+    std::cerr << "\n\n" << prompt;
+    for (int i = initial_pos; i < n_iter; i++)
+    {
+        // TODO: allow creation of tensors with external non-owning data.
+        gten::Tensor input(tokens.data(), {(int32_t)tokens.size()}, gten::kInt32);
+        logits = this->logits(input);
+
+        gten::Timer timer(&time_sample_ms_);
+        const float *logits_data = logits.data_ptr<float>();
+
+        float max_prob = -INFINITY;
+        int max_index = 0;
+        for (int j = 0; j < logits_size; ++j){
+            if (logits_data[j] > max_prob) {
+                max_prob = logits_data[j];
+                max_index = j;
+            }
+        }
+
+        int maxi = max_index;
+        if (maxi == eot_token)
+            break;
+        std::cerr << tokenizer.decode(maxi);
+        tokens.push_back(maxi);
+
+        niter += 1;
+    }
+    std::cerr << "\n";
+
+    show_performance(niter);
+}
+
 void GPT2::sample(const std::string &prompt, double temp, int max_iter)
 {
-    GTEN_CHECK(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %ld.\n", max_iter, config_.n_ctx);
+    GTEN_ASSERT(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %d.\n", max_iter, config_.n_ctx);
 
     time_sample_ms_ = 0;
 
@@ -109,10 +205,11 @@ void GPT2::sample(const std::string &prompt, double temp, int max_iter)
     const int n_iter = max_iter - tokens.size();
 	int64_t niter = 0;
     // Use cerr because it is unbuffered.
-    std::cerr << prompt;
+    std::cerr << "\n\n" << prompt;
     for (int i = initial_pos; i < n_iter; i++)
     {
-        gten::Tensor input(tokens.data(), {(uint32_t)tokens.size()}, gten::Dtype::Int32);
+        // TODO: allow creation of tensors with external non-owning data.
+        gten::Tensor input(tokens.data(), {(int32_t)tokens.size()}, gten::kInt32);
         logits = this->logits(input);
 
         gten::Timer timer(&time_sample_ms_);
@@ -168,16 +265,12 @@ void GPT2::sample(const std::string &prompt, double temp, int max_iter)
 
 void GPT2::show_performance(int64_t niter) const
 {
-    if (niter < 0)
+    if (niter < 1)
         return;
-    std::cout << "\n";
-    std::cout << "------------------------------------\n";
-    std::cout << "LAYER/OP    TIME PER TOKEN  TIME TOTAL\n";
-    std::cout << "------------------------------------\n";
-    std::cout << "Embedding      | " << std::setw(2) << wte_.emb_time()/niter      << "ms | " << wte_.emb_time()      << "ms\n";
-    std::cout << "Embedding proj | " << std::setw(2) << wte_.emb_proj_time()/niter << "ms | " << wte_.emb_proj_time() << "ms\n";
-    std::cout << "Pos embedding  | " << std::setw(2) << wpe_.time()/niter          << "ms | " << wpe_.time()          << "ms\n";
 
+    int64_t emb_time = wte_.emb_time();
+    int64_t emb_proj_time = wte_.emb_proj_time();
+    int64_t wpe_time = wpe_.time();
     int64_t linear_time = 0;
     int64_t mlpp_time = 0;
     int64_t attn_lin = 0;
@@ -197,18 +290,30 @@ void GPT2::show_performance(int64_t niter) const
     }
     ln_time += ln_f_.time();
     res_time += res_.time();
-    std::cout << "Linear (total) | " << std::setw(2) << linear_time/niter << "ms | " << linear_time << "ms\n";
-    // std::cout << "Linear (qkv)   | " << std::setw(2) << attn_lin/niter    << "ms | " << attn_lin    << "ms\n";
-    // std::cout << "Linear (mlp)   | " << std::setw(2) << mlpp_time/niter   << "ms | " << mlpp_time   << "ms\n";
-    std::cout << "Attention      | " << std::setw(2) << attn_time/niter   << "ms | " << attn_time   << "ms\n";
-    std::cout << "Layer norm     | " << std::setw(2) << ln_time/niter     << "ms | " << ln_time     << "ms\n";
-    std::cout << "GELU           | " << std::setw(2) << gelu_time/niter   << "ms | " << gelu_time   << "ms\n";
-    std::cout << "Residual       | " << std::setw(2) << res_time/niter    << "ms | " << res_time   << "ms\n";
-    std::cout << "Sampler        | " << std::setw(2) << time_sample_ms_/niter    << "ms | " << time_sample_ms_   << "ms\n";
+    int64_t total = emb_time + emb_proj_time + wpe_time + linear_time + attn_time + ln_time + gelu_time + res_time + time_sample_ms_;
+
+    std::cout << "\n";
+    std::cout << "------------------------------------\n";
+    std::cout << "LAYER/OP    TIME PER TOKEN  TIME TOTAL\n";
+    std::cout << "------------------------------------\n";
+    std::cout << "Embedding      | " << std::setw(3) << emb_time/niter        << "ms | " << emb_time        << "ms\n";
+    std::cout << "Embedding proj | " << std::setw(3) << emb_proj_time/niter   << "ms | " << emb_proj_time   << "ms\n";
+    std::cout << "Pos embedding  | " << std::setw(3) << wpe_time/niter        << "ms | " << wpe_time        << "ms\n";
+    std::cout << "Linear(qkv+mlp)| " << std::setw(3) << linear_time/niter     << "ms | " << linear_time     << "ms\n";
+    // std::cout << "Linear (qkv)   | " << std::setw(2) << attn_lin/niter     << "ms | " << attn_lin        << "ms\n";
+    // std::cout << "Linear (mlp)   | " << std::setw(2) << mlpp_time/niter    << "ms | " << mlpp_time       << "ms\n";
+    std::cout << "Attention      | " << std::setw(3) << attn_time/niter       << "ms | " << attn_time       << "ms\n";
+    std::cout << "Layer norm     | " << std::setw(3) << ln_time/niter         << "ms | " << ln_time         << "ms\n";
+    std::cout << "Gelu           | " << std::setw(3) << gelu_time/niter       << "ms | " << gelu_time       << "ms\n";
+    std::cout << "Residual       | " << std::setw(3) << res_time/niter        << "ms | " << res_time        << "ms\n";
+    std::cout << "Sampler        | " << std::setw(3) << time_sample_ms_/niter << "ms | " << time_sample_ms_ << "ms\n";
+    std::cout << "Loading        | " << std::setw(3) << ""                    << "   | " << time_load_ms_   << "ms\n";
+    std::cout << "------------------------------------\n";
+    std::cout << "TOTAL          | " << std::setw(3) << total/niter    << "ms | " << total << "ms\n";
     std::cout << "------------------------------------\n\n";
 }
 
-/** File format.
+/** File format. time_load_ms_
  * The GPT2 gten file format is designed to be simple and minimal. We pack vocab,
  * config and layer weight data in a single binary file. The different sections have
  * names to allow for debugging.
@@ -230,23 +335,53 @@ void GPT2::show_performance(int64_t niter) const
  *    _    | section_data      | section_data_size
  *  -------------------------------------------
 */
+
 void GPT2::load_from_file(const std::string &fname)
 {
 	using namespace gten;
 
     std::ifstream fin(fname, std::ios::binary);
-    GTEN_CHECK(fin.is_open(), "Failed to open model file: %s\n", fname.c_str());
+    GTEN_ASSERT(fin.is_open(), "Failed to open model file: %s\n", fname.c_str());
 
-    std::cout << "Loading from " << fname.c_str() << "\n";
-    int64_t load_time;
-    gten::Timer timer(&load_time);
+    // std::cout << "Loading from " << fname.c_str() << "\n";
+    gten::Timer timer(&time_load_ms_);
 
     int64_t magic;
     fin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    GTEN_CHECK(magic == magic_number_, "Magic number in file %s does not match the expected one.\n", fname.c_str());
+    GTEN_ASSERT(magic == magic_number_, "Magic number in file %s does not match the expected one.\n", fname.c_str());
 
+    int64_t weights_dtype_size;
+    fin.read(reinterpret_cast<char*>(&weights_dtype_size), sizeof(weights_dtype_size));
+    // std::cout << "Model dtype size: " << weights_dtype_size << " bytes\n";
+    InferenceMode inference_mode;
+    if (weights_dtype_size == 2) {
+        inference_mode = kFloat16;
+        std::cerr << "Inference mode: FP16\n";
+    }
+    else if (weights_dtype_size == 4) {
+        std::cerr << "Inference mode: FP32\n";
+        inference_mode = kFloat32;
+    }
+    else
+        GTEN_ASSERT(false, "Unknown weight dtype size: %ld", weights_dtype_size);
+    
     config_ = GPT2Config();
-    fin.read(reinterpret_cast<char*>(&config_), sizeof(config_));
+    // We could just read the data in the config directly but the config stores
+    // the data in int32_t type while the data in the input file is in int64_t type.
+    // Changing the config data types to int64_t causes a lot of narrowing
+    // conversions in modules.cpp. The solution to this is to promote all usage
+    // of int32 to int64.
+    int64_t temp_config_value;
+    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
+    config_.n_vocab = static_cast<int32_t>(temp_config_value);
+    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
+    config_.n_ctx = static_cast<int32_t>(temp_config_value);
+    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
+    config_.n_embed = static_cast<int32_t>(temp_config_value);
+    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
+    config_.n_layer = static_cast<int32_t>(temp_config_value);
+    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
+    config_.n_head = static_cast<int32_t>(temp_config_value);
     std::cout << config_;
 
     // Vocab
@@ -266,9 +401,9 @@ void GPT2::load_from_file(const std::string &fname)
     segment_name.resize(segment_name_size);
     fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
     fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    gten::Tensor wte_weight({(uint32_t)config_.n_vocab, (uint32_t)config_.n_embed}, Dtype::Float32);
-    fin.read(reinterpret_cast<char*>(wte_weight.data_ptr<void>()), segment_size);
-    wte_ = gten::Embedding(wte_weight, config_.n_ctx);
+    Tensor wte_weight({config_.n_vocab, config_.n_embed}, inference_mode);
+    fin.read(wte_weight.data_ptr<char>(), segment_size);
+    wte_ = gten::Embedding(inference_mode, wte_weight, config_.n_ctx);
     // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     // WPE
@@ -276,13 +411,13 @@ void GPT2::load_from_file(const std::string &fname)
     segment_name.resize(segment_name_size);
     fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
     fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    gten::Tensor wpe_weight({(uint32_t)config_.n_ctx, (uint32_t)config_.n_embed}, Dtype::Float32);
-    fin.read(reinterpret_cast<char*>(wpe_weight.data_ptr<void>()), segment_size);
-    wpe_ = gten::PosEmbedding(wpe_weight, config_.n_ctx);
+    Tensor wpe_weight({config_.n_ctx, config_.n_embed}, inference_mode);
+    fin.read(wpe_weight.data_ptr<char>(), segment_size);
+    wpe_ = PosEmbedding(inference_mode, wpe_weight, config_.n_ctx);
     // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     // BLOCKS
-    blocks_ = std::vector<gten::ResidualAttentionBlock>();
+    blocks_ = std::vector<ResidualAttentionBlock>();
     blocks_.reserve(config_.n_layer);
     for (int64_t i = 0; i < config_.n_layer; i++)
     {
@@ -292,52 +427,54 @@ void GPT2::load_from_file(const std::string &fname)
         fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
         // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
-        Tensor qw({(uint32_t)config_.n_embed, (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor qb({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor kw({(uint32_t)config_.n_embed, (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor kb({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor vw({(uint32_t)config_.n_embed, (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor vb({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor attn_projw({(uint32_t)config_.n_embed, (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor attn_projb({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor ln_1w({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor ln_1b({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor mlp_fcw({4 * (uint32_t)config_.n_embed, (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor mlp_fcb({4 * (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor mlp_projw({(uint32_t)config_.n_embed, 4 * (uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor mlp_projb({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor ln_2w({(uint32_t)config_.n_embed}, Dtype::Float32);
-        Tensor ln_2b({(uint32_t)config_.n_embed}, Dtype::Float32);           
+        Tensor qw({config_.n_embed, config_.n_embed}, inference_mode);
+        Tensor qb({config_.n_embed}, inference_mode);
+        Tensor kw({config_.n_embed, config_.n_embed}, inference_mode);
+        Tensor kb({config_.n_embed}, inference_mode);
+        Tensor vw({config_.n_embed, config_.n_embed}, inference_mode);
+        Tensor vb({config_.n_embed}, inference_mode);
+        Tensor attn_projw({config_.n_embed, config_.n_embed}, inference_mode);
+        Tensor attn_projb({config_.n_embed}, inference_mode);
+        Tensor ln_1w({config_.n_embed}, inference_mode);
+        Tensor ln_1b({config_.n_embed}, inference_mode);
+        Tensor mlp_fcw({4 * config_.n_embed, config_.n_embed}, inference_mode);
+        Tensor mlp_fcb({4 * config_.n_embed}, inference_mode);
+        Tensor mlp_projw({config_.n_embed, 4 * config_.n_embed}, inference_mode);
+        Tensor mlp_projb({config_.n_embed}, inference_mode);
+        Tensor ln_2w({config_.n_embed}, inference_mode);
+        Tensor ln_2b({config_.n_embed}, inference_mode);           
 
-        fin.read(reinterpret_cast<char*>(qw.data_ptr<void>()),         qw.numel()         * qw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(qb.data_ptr<void>()),         qb.numel()         * qb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(kw.data_ptr<void>()),         kw.numel()         * kw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(kb.data_ptr<void>()),         kb.numel()         * kb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(vw.data_ptr<void>()),         vw.numel()         * vw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(vb.data_ptr<void>()),         vb.numel()         * vb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(attn_projw.data_ptr<void>()), attn_projw.numel() * attn_projw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(attn_projb.data_ptr<void>()), attn_projb.numel() * attn_projb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(ln_1w.data_ptr<void>()),      ln_1w.numel()      * ln_1w.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(ln_1b.data_ptr<void>()),      ln_1b.numel()      * ln_1b.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(mlp_fcw.data_ptr<void>()),    mlp_fcw.numel()    * mlp_fcw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(mlp_fcb.data_ptr<void>()),    mlp_fcb.numel()    * mlp_fcb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(mlp_projw.data_ptr<void>()),  mlp_projw.numel()  * mlp_projw.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(mlp_projb.data_ptr<void>()),  mlp_projb.numel()  * mlp_projb.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(ln_2w.data_ptr<void>()),      ln_2w.numel()      * ln_2w.bytes_per_item());
-        fin.read(reinterpret_cast<char*>(ln_2b.data_ptr<void>()),      ln_2b.numel()      * ln_2b.bytes_per_item());
+        fin.read(qw.data_ptr<char>(),         qw.numel()         * qw.itemsize());
+        fin.read(qb.data_ptr<char>(),         qb.numel()         * qb.itemsize());
+        fin.read(kw.data_ptr<char>(),         kw.numel()         * kw.itemsize());
+        fin.read(kb.data_ptr<char>(),         kb.numel()         * kb.itemsize());
+        fin.read(vw.data_ptr<char>(),         vw.numel()         * vw.itemsize());
+        fin.read(vb.data_ptr<char>(),         vb.numel()         * vb.itemsize());
+        fin.read(attn_projw.data_ptr<char>(), attn_projw.numel() * attn_projw.itemsize());
+        fin.read(attn_projb.data_ptr<char>(), attn_projb.numel() * attn_projb.itemsize());
+        fin.read(ln_1w.data_ptr<char>(),      ln_1w.numel()      * ln_1w.itemsize());
+        fin.read(ln_1b.data_ptr<char>(),      ln_1b.numel()      * ln_1b.itemsize());
+        fin.read(mlp_fcw.data_ptr<char>(),    mlp_fcw.numel()    * mlp_fcw.itemsize());
+        fin.read(mlp_fcb.data_ptr<char>(),    mlp_fcb.numel()    * mlp_fcb.itemsize());
+        fin.read(mlp_projw.data_ptr<char>(),  mlp_projw.numel()  * mlp_projw.itemsize());
+        fin.read(mlp_projb.data_ptr<char>(),  mlp_projb.numel()  * mlp_projb.itemsize());
+        fin.read(ln_2w.data_ptr<char>(),      ln_2w.numel()      * ln_2w.itemsize());
+        fin.read(ln_2b.data_ptr<char>(),      ln_2b.numel()      * ln_2b.itemsize());
 
-        const Linear query(qw, qb, config_.n_ctx);
-        const Linear key(kw, kb, config_.n_ctx);
-        const Linear value(vw, vb, config_.n_ctx);
-        const Linear out_proj(attn_projw, attn_projb, config_.n_ctx);
-        const MultiHeadSelfAttn self_attn(query, key, value, out_proj, config_.n_ctx, config_.n_embed, config_.n_head);
-        const LayerNorm ln_1(ln_1w, ln_1b, config_.n_ctx);
-        const Linear mlp_fc(mlp_fcw, mlp_fcb, config_.n_ctx);
-        const Linear mlp_proj(mlp_projw, mlp_projb, config_.n_ctx);
-        const LayerNorm ln_2(ln_2w, ln_2b, config_.n_ctx);
-        const GELU gelu(config_.n_ctx, config_.n_embed * 4);
+        Linear query(inference_mode, qw, qb, config_.n_ctx);
+        Linear key(inference_mode, kw, kb, config_.n_ctx);
+        Linear value(inference_mode, vw, vb, config_.n_ctx);
+        Linear out_proj(inference_mode, attn_projw, attn_projb, config_.n_ctx);
 
-        blocks_.push_back(ResidualAttentionBlock(self_attn, ln_1, mlp_fc, mlp_proj, ln_2, gelu, config_.n_ctx, config_.n_embed));
+        MultiHeadSelfAttn self_attn(inference_mode, query, key, value, out_proj, config_.n_ctx, config_.n_embed, config_.n_head);
+        LayerNorm ln_1(inference_mode, ln_1w, ln_1b, config_.n_ctx);
+        Linear mlp_fc(inference_mode, mlp_fcw, mlp_fcb, config_.n_ctx);
+        Linear mlp_proj(inference_mode, mlp_projw, mlp_projb, config_.n_ctx);
+        LayerNorm ln_2(inference_mode, ln_2w, ln_2b, config_.n_ctx);
+        GELU gelu(inference_mode, config_.n_ctx, config_.n_embed * 4);
+
+        ResidualAttentionBlock bl(inference_mode, self_attn, ln_1, mlp_fc, mlp_proj, ln_2, gelu, config_.n_ctx, config_.n_embed);
+        blocks_.push_back(std::move(bl));
     }
     
     // LN_F
@@ -347,15 +484,11 @@ void GPT2::load_from_file(const std::string &fname)
     fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
     // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
-    Tensor ln_fw({(uint32_t)config_.n_embed}, Dtype::Float32);
-    Tensor ln_fb({(uint32_t)config_.n_embed}, Dtype::Float32);
-    fin.read(reinterpret_cast<char*>(ln_fw.data_ptr<void>()), ln_fw.numel() * ln_fw.bytes_per_item());
-    fin.read(reinterpret_cast<char*>(ln_fb.data_ptr<void>()), ln_fb.numel() * ln_fb.bytes_per_item());
+    Tensor ln_fw({config_.n_embed}, inference_mode);
+    Tensor ln_fb({config_.n_embed}, inference_mode);
+    fin.read(ln_fw.data_ptr<char>(), ln_fw.numel() * ln_fw.itemsize());
+    fin.read(ln_fb.data_ptr<char>(), ln_fb.numel() * ln_fb.itemsize());
 
-    ln_f_ = LayerNorm(ln_fw, ln_fb, config_.n_ctx);
-
-    res_ = Residual(config_.n_ctx, config_.n_embed);
-
-    timer.stop();
-    std::cout << "Load time: " << load_time << " ms\n\n";
+    ln_f_ = LayerNorm(inference_mode, ln_fw, ln_fb, config_.n_ctx);
+    res_ = Residual(inference_mode, config_.n_ctx, config_.n_embed);
 }

@@ -1,91 +1,111 @@
 #pragma once
 
+#include <cstdio>
 #include <cstdint>
-#include <stdexcept>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
 
-
-// Replace with C++ 20 __VA_OPT__, ##__VA_ARGS__ may not work on non-gcc compilers. 
-#define GTEN_CHECK(boolean, message, ...)             \
-    if (!(boolean)) {                                 \
-        std::fprintf(stderr, "LINE: %d: ", __LINE__); \
-        std::fprintf(stderr, message, ##__VA_ARGS__); \
-        std::fprintf(stderr, "\n");                   \
-        throw std::runtime_error("gten error");       \
-    }  
+#include "utils.h"
 
 namespace gten {
-
-enum class Dtype { Float32, Int32 };
 
 class Tensor
 {
 public:
     Tensor() {};
     // Construct a tensor of the given shape and dtype with storage allocated but not initialised.
-    Tensor(const std::vector<uint32_t> &shape, Dtype dtype = Dtype::Float32);
+    Tensor(const std::vector<int32_t>& shape, Dtype dtype);
 
     // Construct a tensor from the given data source with the given shape and dtype.
-    // The tensor copies data and thus does assume ownership of the data.
-    Tensor(const void *data, const std::vector<uint32_t> &shape, Dtype dtype);
+    // The tensor copies data and thus does not assume ownership of the data.
+    Tensor(const void* data, const std::vector<int32_t>& shape, Dtype dtype);
 
     // Copy-construct tensor from source tensor. Data from source tensor is shared with
     // the new tensor and thus data is not copied from source.
-    Tensor(const Tensor &rhs) { copy_from_other(rhs); };
+    Tensor(const Tensor& rhs) noexcept;
 
     // Copy-assign tensor from source tensor. Data from source tensor is shared with the
     // new tensor and thus data is not copied from source.
-    Tensor &operator=(const Tensor &rhs) { copy_from_other(rhs); return *this; };
+    Tensor &operator=(const Tensor& rhs) noexcept;
 
     // Move-construct a tensor from source tensor. The source tensor is left in an invalid
     // state after the move operation.
-    Tensor(Tensor &&rhs) { move_from_other(std::move(rhs)); };
+    Tensor(Tensor&& rhs) noexcept;
 
     // Move-assign a tensor from source tensor. The source tensor is left in an invalid
     // state after the move operation.
-    Tensor &operator=(Tensor &&rhs) { move_from_other(std::move(rhs)); return *this; };
+    Tensor &operator=(Tensor&& rhs) noexcept;
 
-    size_t bytes_per_item() const { return 4; };
-    template <typename T> T *data_ptr() { return static_cast<T*>(m_data.get()); };
-    template <typename T> const T *data_ptr() const { return static_cast<T*>(m_data.get()); };
-    Dtype dtype() const { return m_dtype; };
-    bool is_1d() const { return m_shape.size() == 1; };
-    bool is_2d() const { return m_shape.size() == 2; };
-    uint64_t ndims() const { return m_shape.size(); };
-    // Return number of elems in the tensor.
-    uint32_t numel() const { return m_numel; };
-    void reshape(const std::vector<uint32_t> &shape) { validate_shape(shape); m_shape = shape; m_numel = numel_from_shape(); }
-    friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor) { tensor.print();return stream; };
-    void print() const;
-    Tensor to(const Dtype dtype);
-    const std::vector<uint32_t> &shape() const { return m_shape; };
+    ~Tensor();
+    
+    // Get the pointer to internal data buffer.
+    template <typename T> T* data_ptr() { return static_cast<T*>(data_); };
+    template <typename T> const T* data_ptr() const { return static_cast<T*>(data_); };
+    Dtype dtype() const noexcept;
 
-    /// Returns the size of dimension of the given index.
-    uint32_t size(uint32_t i) const {
-        GTEN_CHECK(i < ndims(), "Tensor dim access, %d, is out of range of a tensor with %ld-dims.", i, ndims());
-        return m_shape[i];
-    }
+    // Get the number of bytes that an element in the tensor occupies.
+    size_t itemsize() const noexcept;
+
+    bool is_1d() const noexcept;
+    bool is_2d() const noexcept;
+    int32_t ndims() const noexcept;
+
+    // Get the number of elems in the tensor.
+    int32_t numel() const noexcept;
+
+    // Change the shape of the tensor. This function only changes the shape and number
+    // of elements data and does not reallocate the storage. Therefore, the tensor must
+    // have enough space preallocated to accommodate any changes otherwise an error is
+    // emitted.
+    void resize(const std::vector<int32_t>& shape) noexcept;
+    void resize(std::vector<int32_t>&& shape) noexcept;
+
+    friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor);
+    void print() const noexcept;
+
+    /// Returns the size of the give dimension.
+    int32_t size(int32_t i) const;
+    const std::vector<int32_t>& shape() const noexcept;
+    size_t nbytes() const noexcept;
 
 private:
-    std::vector<uint32_t> m_shape;
-    std::vector<uint32_t> m_strides;
-    Dtype m_dtype = Dtype::Float32;
+    std::vector<int32_t> shape_;
+    std::vector<int32_t> strides_;
+    Dtype dtype_;
+    int32_t numel_ = 0;
 
-    uint32_t m_numel;
-    // We may share the same data across many tensors.
-    std::shared_ptr<void> m_data;
+    // Allocated storage size, in bytes, when the tensor is initialised.
+    size_t storage_size_ = 0;
 
-    void set_strides(const std::vector<uint32_t> &shape);
-    uint32_t numel_from_shape();
+    // Pointer to tensor data storage.
+    void* data_;
+
+    // We use a simple reference counting technique to allow many tensors to share the same
+    // data. This pointer points to a heap-allocated block where we record how many tensors
+    // share the same data as this tensor. Each of those tensors also have a copy of this
+    // pointer. When a tensor is copied, the refcount is increased. When a tensor destructor
+    // is called, it decreases the refcount. If the refcount hits zero the data get deallocated.
+    // Also, refcount ptr being null is a sort of weak ptr depending on whether the data ptr has
+    // a valid address.
+    // Note: The current refcount implementation is NOT thread-safe.
+    // TODO: make thread-safe.
+    int32_t* refcount_ = nullptr;
+
+    // Increase refcount by one.
+    void incref();
+
+    // Decrease refcount by one. If refcount hits zero, the data is deallocated.
+    void decref();
+
+    void set_strides(const std::vector<int32_t>& shape);
+    int32_t numel_from_shape() const noexcept;
     // Note: This method does NOT copy the data in the buffer from other to self. It
     // only copies the pointer. If either `self` or `other` data is modified after a
     // call to this method, the modification will affect both tensors.
-    void copy_from_other(const Tensor &other);
-    void move_from_other(Tensor &&other);
-    void validate_shape(const std::vector<uint32_t> &shape) const;
-    void print_single(const uint32_t item_idx, const uint32_t col_idx, const uint32_t n_cols) const;
+    void validate_shape(const std::vector<int32_t>& shape) const;
+    void print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) const noexcept;
 };
 
 } // namespace gten

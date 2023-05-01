@@ -6,11 +6,11 @@
             "command": "/usr/bin/g++",
             "args": [
                 "-fdiagnostics-color=always",
-                "-O3",
-                "-ffast-math",
-                "-mavx",
+                "-O0",
+                // "-ffast-math",
+                // "-mavx",
                 "-g",
-                "${workspaceFolder}/src/*.cpp",
+                "${workspaceFolder}/*.cpp",
                 "-o",
                 "${fileDirname}/${fileBasenameNoExtension}"
             ],
