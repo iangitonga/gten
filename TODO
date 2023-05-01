@@ -11,3 +11,4 @@ A list of features to be added.
 - Implement non-owning Tensor.
 - Better model Tensors loading structure.
 - Layernorm vector
+- Support -xl model.

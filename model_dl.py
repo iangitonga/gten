@@ -4,10 +4,16 @@ import os
 import sys
 from urllib import request
 
-MODELS = {
-    "GPT-2-117M": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-117M.gten",
-    "GPT-2-345M": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-345M.gten",
-    "GPT-2-762M": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-762M.gten",
+
+MODELS = ("GPT-2-117M", "GPT-2-345M", "GPT-2-762M")
+
+MODELS_URLS = {
+    "GPT-2-117M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-117M.fp32.gten",
+    "GPT-2-345M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-345M.fp32.gten",
+    "GPT-2-762M.fp32": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-762M.fp32.gten",
+    "GPT-2-117M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-117M.fp16.gten",
+    "GPT-2-345M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-345M.fp16.gten",
+    "GPT-2-762M.fp16": "https://huggingface.co/iangitonga/gten/resolve/main/GPT-2-762M.fp16.gten",
 }
 
 
@@ -40,7 +46,8 @@ def download_model(model_name, inference_mode):
     if os.path.exists(model_path):
         return
     os.makedirs("models", exist_ok=True)
-    _download_model(MODELS[model_name], model_path)
+    model_url_key = f"{model_name}.fp16" if inference_mode == "f16" else f"{model_name}.fp32"
+    _download_model(MODELS_URLS[model_url_key], model_path)
 
 
 if len(sys.argv) < 3 or sys.argv[1] not in MODELS:
