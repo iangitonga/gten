@@ -294,10 +294,10 @@ MODEL_URL = {
 }
 
 MODEL_CONFIG = {
-    "Gpt2": ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state =  768, n_layer = 12, n_head = 12, n_mlp =  768 * 4),
+    "Gpt2":        ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state =  768, n_layer = 12, n_head = 12, n_mlp =  768 * 4),
     "Gpt2-medium": ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1024, n_layer = 24, n_head = 16, n_mlp = 1024 * 4),
-    "Gpt2-large": ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1280, n_layer = 36, n_head = 20, n_mlp = 1280 * 4),
-    "Gpt2-xl":ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1600, n_layer = 48, n_head = 25, n_mlp = 1600 * 4),
+    "Gpt2-large":  ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1280, n_layer = 36, n_head = 20, n_mlp = 1280 * 4),
+    "Gpt2-xl":     ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1600, n_layer = 48, n_head = 25, n_mlp = 1600 * 4),
 }
 
 

@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-#include "utils.h"
+#include "gten_types.h"
 
 namespace gten {
 
@@ -15,11 +15,13 @@ class Tensor
 {
 public:
     Tensor() {};
-    // Construct a tensor of the given shape and dtype with storage allocated but not initialised.
+    // Construct a tensor of the given shape and dtype with storage allocated but not
+    // initialised.
     Tensor(const std::vector<int32_t>& shape, Dtype dtype);
 
     // Construct a tensor from the given data source with the given shape and dtype.
-    // The tensor copies data and thus does not assume ownership of the data.
+    // The data is copied from source and thus the tensor does not assume ownership of
+    // the data.
     Tensor(const void* data, const std::vector<int32_t>& shape, Dtype dtype);
 
     // Copy-construct tensor from source tensor. Data from source tensor is shared with
@@ -55,10 +57,11 @@ public:
     // Get the number of elems in the tensor.
     int32_t numel() const noexcept;
 
-    // Change the shape of the tensor. This function only changes the shape and number
-    // of elements data and does not reallocate the storage. Therefore, the tensor must
-    // have enough space preallocated to accommodate any changes otherwise an error is
-    // emitted.
+    // Resize the tensor to have a new shape. The new shape must not be larger than the
+    // shape provided when the tensor was created because this function does not
+    // reallocate tensor storage.
+    // Note: this is not a reshape function because a reshape function can only reshape
+    // a tensor if the new and the existing shapes have the same number of elements.
     void resize(const std::vector<int32_t>& shape) noexcept;
     void resize(std::vector<int32_t>&& shape) noexcept;
 
@@ -82,15 +85,13 @@ private:
     // Pointer to tensor data storage.
     void* data_;
 
-    // We use a simple reference counting technique to allow many tensors to share the same
-    // data. This pointer points to a heap-allocated block where we record how many tensors
-    // share the same data as this tensor. Each of those tensors also have a copy of this
-    // pointer. When a tensor is copied, the refcount is increased. When a tensor destructor
-    // is called, it decreases the refcount. If the refcount hits zero the data get deallocated.
-    // Also, refcount ptr being null is a sort of weak ptr depending on whether the data ptr has
-    // a valid address.
+    // We use a simple reference counting technique to allow many tensors to share the
+    // same data. This pointer points to a heap-allocated block where we record how many
+    // tensors share the same data as this tensor. Each of those tensors also have a copy
+    // of this pointer. When a tensor is copied, the refcount is increased. When a tensor
+    // destructor is called, it decreases the refcount. If the refcount hits zero the
+    // data get deallocated and the refcount is set to nullptr.
     // Note: The current refcount implementation is NOT thread-safe.
-    // TODO: make thread-safe.
     int32_t* refcount_ = nullptr;
 
     // Increase refcount by one.

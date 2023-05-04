@@ -1,14 +1,10 @@
 A list of features to be added.
 
 - Quantization.
-- Build flags, AVX and non-avx flags.
-- Reduce memory footprint.
-- Implement multithreaded ops.
-- Aggresive error checking.
-- Testing.
-- Provide simple logging functions.
-- Allow generation of arbitrary-length string.
-- Implement non-owning Tensor.
-- Better model Tensors loading structure.
-- Layernorm vector
 - Support -xl model.
+
+- Testing.
+- Allow generation of arbitrary-length string.
+- Memory debuginfo.
+- Build flags, AVX and non-avx flags.
+- Better model Tensors loading structure.

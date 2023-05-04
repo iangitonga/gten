@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <iostream>
 
 #include "tensor.h"
@@ -225,6 +226,31 @@ private:
     GELU gelu_;
     Residual inp_res_;
     Residual attn_res_;
+};
+
+
+class Timer
+{
+public:
+    Timer(int64_t* time_tracker)
+        : time_tracker_(time_tracker)
+    { start_time_ = std::chrono::high_resolution_clock::now(); }
+    ~Timer() { stop(); }
+
+    void stop() {
+        if (stopped_)
+            return;
+        auto end_time = std::chrono::high_resolution_clock::now();
+        int64_t start = std::chrono::time_point_cast<std::chrono::milliseconds>(start_time_).time_since_epoch().count();
+        int64_t end = std::chrono::time_point_cast<std::chrono::milliseconds>(end_time).time_since_epoch().count();
+        int64_t duration = end - start;
+        *time_tracker_ += duration;
+        stopped_ = true;
+    }
+private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
+    int64_t* time_tracker_;
+    bool stopped_ = false;
 };
 
 } // namespace gten

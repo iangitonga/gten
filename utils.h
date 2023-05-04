@@ -5,6 +5,8 @@
 #include <cmath>
 #include <iostream>
 
+#include "gten_types.h"
+
 // TODO: Allow AVX without F16C for FP32 mode.
 #if defined(__AVX__) && defined(__F16C__)
 #define GTEN_SIMD 1
@@ -20,150 +22,185 @@
 namespace gten
 {
 
-// Assert that the given boolean is true. If false, print message and terminate program.
-// TODO: Replace with C++ 20 __VA_OPT__, __VA_ARGS__ may not work on non-gcc compilers.
-#define GTEN_ASSERT(boolean, message, ...)                                              \
-    if (!(boolean)) {                                                                   \
-        std::fprintf(stderr, "\x1B[1;31m");                                             \
-        std::fprintf(stderr, "GTEN ERROR [File `%s` line %d]: ", __FILE__, __LINE__);   \
-        std::fprintf(stderr, message, ##__VA_ARGS__);                                   \
-        std::fprintf(stderr, "\n");                                                     \
-        std::exit(EXIT_FAILURE);                                                        \
-    }  
-
-
-// FUNDAMENTAL SCALAR DATA TYPES.
-typedef int32_t Int32;
-typedef uint16_t Float16;
-typedef float Float32;
-
-// Allows data type information to be stored and passed around as variables because we
-// cannot do that with the types themselves.
-enum class Dtype { Int32, Float16, Float32 };
-
-// Convenient shorthands for the enum class above.
-static Dtype kInt32 = Dtype::Int32;
-static Dtype kFloat16 = Dtype::Float16;
-static Dtype kFloat32 = Dtype::Float32;
-
+#if GTEN_SIMD
 
 #if GTEN_AVX
 
 // FUNDAMENTAL VECTOR DATA TYPES.
-typedef __m256 Vec8_f32;
+typedef __m256 Vec_f32x8;
 
 // FLOATING POINT VECTOR OPERATIONS
 
-// Overloading for fp16 and fp32 inputs pointer types for load and store instructions
-// is type-safe because C++ does not perform implicit conversions between different
-// pointer types, including void ptr. For instance, a call to vec8_f32_load with an
-// Int32* type, will not compile. Such type-safety is important to avoid subtle bugs.
-
-inline Vec8_f32 vec8_f32_load(const Float16* src_ptr) {
+inline Vec_f32x8 vec_f32x8_load(const Float16* src_ptr) {
     return _mm256_cvtph_ps(_mm_loadu_si128((__m128i_u *)(const_cast<Float16*>(src_ptr))));
 }
 
-inline Vec8_f32 vec8_f32_load(const Float32* src_ptr) {
+inline Vec_f32x8 vec_f32x8_load(const Float32* src_ptr) {
     return _mm256_loadu_ps(const_cast<Float32*>(src_ptr));
 }
 
-inline void vec8_f32_store(Vec8_f32 vec, const Float32* dest_ptr) {
-    _mm256_storeu_ps(const_cast<Float32*>(dest_ptr), vec);
+inline void vec_f32x8_store(Vec_f32x8 vec, Float32* dest_ptr) {
+    _mm256_storeu_ps(dest_ptr, vec);
 }
 
-inline void vec8_f32_store(Vec8_f32 vec, const Float16* dest_ptr) {
-    return _mm_storeu_si128((__m128i_u *)(const_cast<Float16*>(dest_ptr)), _mm256_cvtps_ph(vec, 0));
+inline void vec_f32x8_store(Vec_f32x8 vec, Float16* dest_ptr) {
+    return _mm_storeu_si128((__m128i_u *)dest_ptr, _mm256_cvtps_ph(vec, 0));
 }
 
-inline Vec8_f32 vec8_f32_add(Vec8_f32 a, Vec8_f32 b) {
+inline Vec_f32x8 vec_f32x8_add(Vec_f32x8 a, Vec_f32x8 b) {
     return _mm256_add_ps(a, b);
 }
 
+inline Vec_f32x8 vec_f32x8_mul(Vec_f32x8 a, Vec_f32x8 b) {
+    return _mm256_mul_ps(a, b);
+}
+
 // Return A * B + C
-inline Vec8_f32 vec8_f32_fma(Vec8_f32 a, Vec8_f32 b, Vec8_f32 c) {
+inline Vec_f32x8 vec_f32x8_fma(Vec_f32x8 a, Vec_f32x8 b, Vec_f32x8 c) {
     return _mm256_add_ps(_mm256_mul_ps(a, b), c);
 }
 
-inline Float32 vec8_f32_sum(Vec8_f32 vec) {
+inline Float32 vec_f32x8_sum(Vec_f32x8 vec) {
     Float32* f = (Float32 *)(&vec);
     return f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7];
 }
 
-inline Vec8_f32 vec8_f32_setzero() {
+inline Vec_f32x8 vec_f32x8_setzero() {
     return _mm256_setzero_ps();
 }
 #endif
 
+#else // NO SIMD AVAILABLE.
 
 // FLOATING PONT SCALAR OPERATIONS
-inline Float32 fp32_from_bits(uint32_t w) {
-    union {
-        uint32_t as_bits;
-        Float32 as_value;
-    } fp32;
-    fp32.as_bits = w;
-    return fp32.as_value;
-}
 
-inline uint32_t fp32_to_bits(Float32 f) {
-    union {
-        Float32 as_value;
-        uint32_t as_bits;
-    } fp32;
-    fp32.as_value = f;
-    return fp32.as_bits;
-}
+struct Vec_f32x8 {
+    Float32 a[8];
+};
 
-inline Float32 fp16_to_fp32(Float16 h) noexcept
-{
-    const uint32_t w = (uint32_t) h << 16;
-    const uint32_t sign = w & UINT32_C(0x80000000);
-    const uint32_t two_w = w + w;
-
-    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
-    const float exp_scale = fp32_from_bits(UINT32_C(0x7800000));
-    const float normalized_value = fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
-
-    const uint32_t magic_mask = UINT32_C(126) << 23;
-    const float magic_bias = 0.5f;
-    const float denormalized_value = fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
-
-    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
-    const uint32_t result = sign |
-        (two_w < denormalized_cutoff ? fp32_to_bits(denormalized_value) : fp32_to_bits(normalized_value));
-    return fp32_from_bits(result);
-}
-
-// MAX:  65504.0 (0)[11110]{1111111111}
-// MIN: -65504.0 (1)[11110]{1111111111}
-
-inline Float16 fp32_to_fp16(Float32 f) noexcept
-{
-    const float scale_to_inf = fp32_from_bits(UINT32_C(0x77800000));
-    const float scale_to_zero = fp32_from_bits(UINT32_C(0x08800000));
-    float base = (fabsf(f) * scale_to_inf) * scale_to_zero;
-
-    const uint32_t w = fp32_to_bits(f);
-    const uint32_t shl1_w = w + w;
-    const uint32_t sign = w & UINT32_C(0x80000000);
-    uint32_t bias = shl1_w & UINT32_C(0xFF000000);
-    if (bias < UINT32_C(0x71000000)) {
-        bias = UINT32_C(0x71000000);
+static Float32* init_cache() {
+    // TODO: Use smart ptr? 
+    Float32* cache = new Float32[65536];
+    Float16 idx = 0;
+    for (int i = 0; i < 65536; i++)
+    {
+        cache[i] = fp16_to_fp32(idx);
+        idx += 1;
     }
-
-    base = fp32_from_bits((bias >> 1) + UINT32_C(0x07800000)) + base;
-    const uint32_t bits = fp32_to_bits(base);
-    const uint32_t exp_bits = (bits >> 13) & UINT32_C(0x00007C00);
-    const uint32_t mantissa_bits = bits & UINT32_C(0x00000FFF);
-    const uint32_t nonsign = exp_bits + mantissa_bits;
-    return (sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign);
+    return cache;
 }
+
+// Global cache to avoid recomputations.
+static const Float32* G_fp16_to_fp32_cache = init_cache();
+
+inline Vec_f32x8 vec_f32x8_load(const Float16* src_ptr) {
+    Vec_f32x8 v;
+    v.a[0] = G_fp16_to_fp32_cache[src_ptr[0]];
+    v.a[1] = G_fp16_to_fp32_cache[src_ptr[1]];
+    v.a[2] = G_fp16_to_fp32_cache[src_ptr[2]];
+    v.a[3] = G_fp16_to_fp32_cache[src_ptr[3]];
+    v.a[4] = G_fp16_to_fp32_cache[src_ptr[4]];
+    v.a[5] = G_fp16_to_fp32_cache[src_ptr[5]];
+    v.a[6] = G_fp16_to_fp32_cache[src_ptr[6]];
+    v.a[7] = G_fp16_to_fp32_cache[src_ptr[7]];
+    return v;
+}
+
+inline Vec_f32x8 vec_f32x8_load(const Float32* src_ptr) {
+    Vec_f32x8 v;
+    v.a[0] = src_ptr[0];
+    v.a[1] = src_ptr[1];
+    v.a[2] = src_ptr[2];
+    v.a[3] = src_ptr[3];
+    v.a[4] = src_ptr[4];
+    v.a[5] = src_ptr[5];
+    v.a[6] = src_ptr[6];
+    v.a[7] = src_ptr[7];
+    return v;
+}
+
+inline void vec_f32x8_store(Vec_f32x8 v, Float16* dest_ptr) {
+    for (int i = 0; i < 8; i++) {
+        dest_ptr[i] = fp32_to_fp16(v.a[i]);
+    }
+}
+
+inline void vec_f32x8_store(Vec_f32x8 v, Float32* dest_ptr) {
+    dest_ptr[0] = v.a[0];
+    dest_ptr[1] = v.a[1];
+    dest_ptr[2] = v.a[2];
+    dest_ptr[3] = v.a[3];
+    dest_ptr[4] = v.a[4];
+    dest_ptr[5] = v.a[5];
+    dest_ptr[6] = v.a[6];
+    dest_ptr[7] = v.a[7];
+}
+
+inline Vec_f32x8 vec_f32x8_add(Vec_f32x8 v0, Vec_f32x8 v1) {
+    Vec_f32x8 sum;
+    sum.a[0] = v0.a[0] + v1.a[0];
+    sum.a[1] = v0.a[1] + v1.a[1];
+    sum.a[2] = v0.a[2] + v1.a[2];
+    sum.a[3] = v0.a[3] + v1.a[3];
+    sum.a[4] = v0.a[4] + v1.a[4];
+    sum.a[5] = v0.a[5] + v1.a[5];
+    sum.a[6] = v0.a[6] + v1.a[6];
+    sum.a[7] = v0.a[7] + v1.a[7];
+    return sum;
+}
+
+inline Vec_f32x8 vec_f32x8_mul(Vec_f32x8 v0, Vec_f32x8 v1) {
+    Vec_f32x8 fma;
+    fma.a[0] = v0.a[0] * v1.a[0];
+    fma.a[1] = v0.a[1] * v1.a[1];
+    fma.a[2] = v0.a[2] * v1.a[2];
+    fma.a[3] = v0.a[3] * v1.a[3];
+    fma.a[4] = v0.a[4] * v1.a[4];
+    fma.a[5] = v0.a[5] * v1.a[5];
+    fma.a[6] = v0.a[6] * v1.a[6];
+    fma.a[7] = v0.a[7] * v1.a[7];
+    return fma;
+}
+
+inline Vec_f32x8 vec_f32x8_fma(Vec_f32x8 v0, Vec_f32x8 v1, Vec_f32x8 v2) {
+    Vec_f32x8 fma;
+    fma.a[0] = v0.a[0] * v1.a[0] + v2.a[0];
+    fma.a[1] = v0.a[1] * v1.a[1] + v2.a[1];
+    fma.a[2] = v0.a[2] * v1.a[2] + v2.a[2];
+    fma.a[3] = v0.a[3] * v1.a[3] + v2.a[3];
+    fma.a[4] = v0.a[4] * v1.a[4] + v2.a[4];
+    fma.a[5] = v0.a[5] * v1.a[5] + v2.a[5];
+    fma.a[6] = v0.a[6] * v1.a[6] + v2.a[6];
+    fma.a[7] = v0.a[7] * v1.a[7] + v2.a[7];
+    return fma;
+}
+
+inline Float32 vec_f32x8_sum(Vec_f32x8 v) {
+    Float32 sum = v.a[0] + v.a[1] + v.a[2] + v.a[3] + v.a[4] + v.a[5] + v.a[6] + v.a[7];
+    return sum;
+}
+
+inline Vec_f32x8 vec_f32x8_setzero() {
+    Vec_f32x8 v;
+    v.a[0] = 0.0f;
+    v.a[1] = 0.0f;
+    v.a[2] = 0.0f;
+    v.a[3] = 0.0f;
+    v.a[4] = 0.0f;
+    v.a[5] = 0.0f;
+    v.a[6] = 0.0f;
+    v.a[7] = 0.0f;
+    return v;
+}
+
+#endif
+
 
 // Floating point conversion functions below are implemented using templates to ensure
 // type-safety because C++ performs implicit conversions between integal types silently
-// which can lead to subtle bugs if the functions are invoked with inputs of the
-// unintended type. With templates, because we explicitly provide and enforce input
-// types, we cannot have such bugs.
+// which can lead to subtle bugs if the conversion below functions are invoked with
+// inputs of the unintended type. With the templates implementation below, because we
+// explicitly provide and enforce input types, we cannot have such bugs.
 
 // Convert floating point value to Float32. Conversion to Float32 is only allowed from
 // Float32 or Float16. Attempt to convert from any other type will cause a runtime
@@ -200,31 +237,6 @@ inline output_t fpcvt_from_fp32(Float32 value) noexcept {
         return 0;
     }
 }
-
-
-class Timer
-{
-public:
-    Timer(int64_t* time_tracker)
-        : time_tracker_(time_tracker)
-    { start_time_ = std::chrono::high_resolution_clock::now(); }
-    ~Timer() { stop(); }
-
-    void stop() {
-        if (stopped_)
-            return;
-        auto end_time = std::chrono::high_resolution_clock::now();
-        int64_t start = std::chrono::time_point_cast<std::chrono::milliseconds>(start_time_).time_since_epoch().count();
-        int64_t end = std::chrono::time_point_cast<std::chrono::milliseconds>(end_time).time_since_epoch().count();
-        int64_t duration = end - start;
-        *time_tracker_ += duration;
-        stopped_ = true;
-    }
-private:
-    std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
-    int64_t* time_tracker_;
-    bool stopped_ = false;
-};
 
 } // namespace gten
 

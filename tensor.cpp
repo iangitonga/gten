@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 
 
 void* alloc_mem(size_t nbytes) noexcept
@@ -54,7 +55,7 @@ Tensor::Tensor(const Tensor& rhs) noexcept {
     if (this != &rhs)
     {
         // We are constructing a new tensor with data copied from an existing tensor.
-        // So we just copy the data with refcount and incref it.
+        // So we just copy the data and refcount and incref it.
         shape_ = rhs.shape_;
         strides_ = rhs.strides_;
         dtype_ = rhs.dtype_;
@@ -77,8 +78,8 @@ Tensor& Tensor::operator=(const Tensor& rhs) noexcept {
         dtype_ = rhs.dtype_;
         numel_ = rhs.numel_;
         storage_size_ = rhs.storage_size_;
-        data_ = rhs.data_;
         decref(); // Decref the current refcount.
+        data_ = rhs.data_;  // Copy data.
         refcount_ = rhs.refcount_; // Replace by copied decref.
         incref(); // Incref the copied refcount.
     }
@@ -133,9 +134,6 @@ void Tensor::incref() {
 }
 
 void Tensor::decref() {
-    // An invariant for sharing. if refcount ptr has a valid addresses, the data ptr
-    // must also  have a valid address. Otherwise, we could end up deallocating a
-    // deallocated memory block. 
     if (refcount_) {
         *refcount_ = *refcount_ - 1;
         if (*refcount_ == 0) {
@@ -239,9 +237,15 @@ void Tensor::print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) con
 {
     uint32_t max_cols = dtype_ == kInt32 ? 32 : 8;
     if (dtype_ == kFloat16)
-        std::cout << fp16_to_fp32(reinterpret_cast<Float16*>(data_)[item_idx]);
+        std::cout << std::fixed
+                  << std::setprecision(4)
+                  << std::setw(7)
+                  << fp16_to_fp32(reinterpret_cast<Float16*>(data_)[item_idx]);
     else if (dtype_ == kFloat32)
-        std::cout << reinterpret_cast<Float32*>(data_)[item_idx];
+        std::cout << std::fixed
+                  << std::setprecision(4)
+                  << std::setw(7)
+                  << reinterpret_cast<Float32*>(data_)[item_idx];
     else if (dtype_ ==kInt32)
         std::cout << reinterpret_cast<Int32*>(data_)[item_idx];
     if (col_idx != n_cols - 1)

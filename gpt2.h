@@ -24,7 +24,7 @@ class GPT2
 public:
     gten::GPT2Tokenizer tokenizer;
 
-    GPT2(const std::string &fname);
+    GPT2(const std::string &fname, bool show_load_info);
     gten::Tensor logits(const gten::Tensor &inp);
     void show_performance(int64_t niter) const;
     void sample(const std::string &prompt, double temp = 1.0, int max_iter = 1000);
@@ -41,5 +41,5 @@ private:
     int64_t time_sample_ms_ = 0;
     int64_t time_load_ms_ = 0;
     
-    void load_from_file(const std::string &fname);
+    void load_from_file(const std::string &fname, bool show_load_info);
 };

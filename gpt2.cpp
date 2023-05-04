@@ -17,8 +17,10 @@ Optional args.
 -sm :      Use small model (117M) for inference.
 -md :      Use medium model (345M) for inference. This model is chosen by default.
 -lg :      Use large model (762M) for inference.
--f32:      Use 32-bit floating point values for inference. Default is f16.
---temp T : Temperature to use during sampling. Default is 0.9. It must be greater than 0. 
+-f32:      Use 32-bit floating point values for inference instead of f16 which is the default.
+-debug   : See debug-level information.
+--temp T : Temperature to use during sampling. It must be greater than 0. [default=0.9].
+--len  L : Number of words to generate. Minimum is 1 and max is 1000. [default=250].
 
 Examples:
   ./gpt2 -p "Once upon a time" 
@@ -37,6 +39,8 @@ int main(int argc, char const *argv[])
     std::string model_name = "Gpt2-medium";
     std::string inference_mode = "f16";
     double temperature = 0.9;
+    int gen_tokens = 250;
+    bool debug = false;
     for (int i = 1; i < argc; i++)
     {
         std::string_view arg(argv[i]);
@@ -57,6 +61,9 @@ int main(int argc, char const *argv[])
         else if (arg == "-f32") {
             inference_mode = "f32";
         }
+        else if (arg == "-debug") {
+            debug = true;
+        }
         else if (arg == "--temp") {
             if (argc <= i+1) {
                 std::cout << "Temp value is missing.\n";
@@ -75,6 +82,25 @@ int main(int argc, char const *argv[])
             }
             temperature = temp;
             i += 1; // skip parsed temp.
+        }
+        else if (arg == "--len") {
+            if (argc <= i+1) {
+                std::cout << "Length value is missing.\n";
+                return -1;
+            }
+            int len;
+            try {
+                len = std::stoi(argv[i+1]);
+            } catch (...) {
+                std::cout << "Invalid Length value.\n";
+                return -1;
+            }
+            if (len < 1 || len > 1000) {
+                std::cout << "Length must be greater than 1 and less than 1000.\n";
+                return -1;
+            }
+            gen_tokens = len;
+            i += 1;
         }
         else {
             std::cout << "Unknown option: " << arg << "\n";
@@ -102,29 +128,31 @@ int main(int argc, char const *argv[])
     if (inference_mode == "f32")
         model_dir = std::string("models/") + model_name + ".fp32.gten";
 
-    GPT2 model(model_dir);
+    if (debug) {
+        std::cout << "Model name     : " << model_name << "\n";
+        std::cout << "Model path     : " << model_dir << "\n";
+        std::cout << "Inference      : " << inference_mode << "\n";
+        std::cout << "Temperature    : " << temperature << "\n";
+        std::cout << "Gen toks len   : " << gen_tokens << "\n";
+    }
 
-    model.sample(prompt, temperature, 1000);
+    GPT2 model(model_dir, debug);
+
+    model.sample(prompt, temperature, gen_tokens);
 
     return 0;
 }
 
 
 
-// #########################################################################
-// #########################################################################
-
-
-GPT2::GPT2(const std::string &fname)
+GPT2::GPT2(const std::string &fname, bool show_load_info)
 {
-    load_from_file(fname);
+    load_from_file(fname, show_load_info);
 }
 
 gten::Tensor GPT2::logits(const gten::Tensor &inp)
 {
     gten::Tensor logits;
-
-    // std::cerr << wte_.forward(inp) << "\n";
 
     logits = res_.forward(wte_.forward(inp), wpe_.forward(inp.size(0)));
     for (auto &block : blocks_)
@@ -135,10 +163,9 @@ gten::Tensor GPT2::logits(const gten::Tensor &inp)
     return logits;
 }
 
+// Used for debugging purposes.
 void GPT2::greedy_sample(const std::string &prompt, double temp, int max_iter)
 {
-    GTEN_ASSERT(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %d.\n", max_iter, config_.n_ctx);
-
     time_sample_ms_ = 0;
 
 
@@ -184,33 +211,39 @@ void GPT2::greedy_sample(const std::string &prompt, double temp, int max_iter)
     show_performance(niter);
 }
 
-void GPT2::sample(const std::string &prompt, double temp, int max_iter)
+void GPT2::sample(const std::string& prompt, double temp, int ntokens)
 {
-    GTEN_ASSERT(max_iter <= config_.n_ctx, "max_iter, %d, cannot exceed maximum context length, %d.\n", max_iter, config_.n_ctx);
-
     time_sample_ms_ = 0;
 
+    const int max_ctx_size = 1000;
     std::random_device rd;
     std::mt19937 gen(rd());
 
     std::vector<int32_t> tokens = tokenizer.encode(prompt);
-    tokens.reserve(max_iter);
-    gten::Tensor logits;
+    if (tokens.size() >= max_ctx_size) {
+        // Prompt length is too large, quit. Technically, we can allow generation of
+        // arbitrary-length documents by selecting the last 1000 context tokens and using
+        // that to predict the next token but the modules are not yet designed with that
+        // in mind. In the future that feature will be available.
+        GTEN_ASSERT(false, "Prompt length is too large!");
+    }
+    tokens.reserve(ntokens + tokens.size());
     const int logits_size = 50257;
     std::vector<std::pair<double, int>> logits_probs;
     logits_probs.reserve(logits_size);
-
     const int eot_token = 50256;
     const int initial_pos = tokens.size() - 1;
-    const int n_iter = max_iter - tokens.size();
+    // If the requested ntokens + ctx_size > max_prompt_size, generate up to
+    // max_prompt_size else generate up to requested size.
+    const int max_iter = (ntokens + tokens.size()) >= max_ctx_size ? max_ctx_size : ntokens + tokens.size();
 	int64_t niter = 0;
     // Use cerr because it is unbuffered.
     std::cerr << "\n\n" << prompt;
-    for (int i = initial_pos; i < n_iter; i++)
+    for (int i = initial_pos; i < max_iter; i++)
     {
         // TODO: allow creation of tensors with external non-owning data.
         gten::Tensor input(tokens.data(), {(int32_t)tokens.size()}, gten::kInt32);
-        logits = this->logits(input);
+        gten::Tensor logits = this->logits(input);
 
         gten::Timer timer(&time_sample_ms_);
         const float *logits_data = logits.data_ptr<float>();
@@ -293,9 +326,9 @@ void GPT2::show_performance(int64_t niter) const
     int64_t total = emb_time + emb_proj_time + wpe_time + linear_time + attn_time + ln_time + gelu_time + res_time + time_sample_ms_;
 
     std::cout << "\n";
-    std::cout << "------------------------------------\n";
+    std::cout << "--------------------------------------\n";
     std::cout << "LAYER/OP    TIME PER TOKEN  TIME TOTAL\n";
-    std::cout << "------------------------------------\n";
+    std::cout << "--------------------------------------\n";
     std::cout << "Embedding      | " << std::setw(3) << emb_time/niter        << "ms | " << emb_time        << "ms\n";
     std::cout << "Embedding proj | " << std::setw(3) << emb_proj_time/niter   << "ms | " << emb_proj_time   << "ms\n";
     std::cout << "Pos embedding  | " << std::setw(3) << wpe_time/niter        << "ms | " << wpe_time        << "ms\n";
@@ -308,12 +341,12 @@ void GPT2::show_performance(int64_t niter) const
     std::cout << "Residual       | " << std::setw(3) << res_time/niter        << "ms | " << res_time        << "ms\n";
     std::cout << "Sampler        | " << std::setw(3) << time_sample_ms_/niter << "ms | " << time_sample_ms_ << "ms\n";
     std::cout << "Loading        | " << std::setw(3) << ""                    << "   | " << time_load_ms_   << "ms\n";
-    std::cout << "------------------------------------\n";
+    std::cout << "--------------------------------------\n";
     std::cout << "TOTAL          | " << std::setw(3) << total/niter    << "ms | " << total << "ms\n";
-    std::cout << "------------------------------------\n\n";
+    std::cout << "--------------------------------------\n\n";
 }
 
-/** File format. time_load_ms_
+/** File format.
  * The GPT2 gten file format is designed to be simple and minimal. We pack vocab,
  * config and layer weight data in a single binary file. The different sections have
  * names to allow for debugging.
@@ -321,6 +354,7 @@ void GPT2::show_performance(int64_t niter) const
  *  number |     section       | size in bytes
  *  ------------------------------------------
  *    1    |      magic        | 8
+ *    2    |  dtype_byte_size  | 8
  *    2    |     n_vocab       | 8
  *    3    |      n_ctx        | 8
  *    4    |     n_embed       | 8
@@ -336,14 +370,15 @@ void GPT2::show_performance(int64_t niter) const
  *  -------------------------------------------
 */
 
-void GPT2::load_from_file(const std::string &fname)
+void GPT2::load_from_file(const std::string &fname, bool show_load_info)
 {
 	using namespace gten;
 
     std::ifstream fin(fname, std::ios::binary);
     GTEN_ASSERT(fin.is_open(), "Failed to open model file: %s\n", fname.c_str());
 
-    // std::cout << "Loading from " << fname.c_str() << "\n";
+    if (show_load_info)
+        std::cout << "Loading from   : " << fname.c_str() << "\n";
     gten::Timer timer(&time_load_ms_);
 
     int64_t magic;
@@ -352,14 +387,15 @@ void GPT2::load_from_file(const std::string &fname)
 
     int64_t weights_dtype_size;
     fin.read(reinterpret_cast<char*>(&weights_dtype_size), sizeof(weights_dtype_size));
-    // std::cout << "Model dtype size: " << weights_dtype_size << " bytes\n";
+    if (show_load_info)
+        std::cout << "FP mode size   : " << weights_dtype_size << " bytes\n";
     InferenceMode inference_mode;
     if (weights_dtype_size == 2) {
         inference_mode = kFloat16;
-        std::cerr << "Inference mode: FP16\n";
+        std::cerr << "Inference mode : FP16\n";
     }
     else if (weights_dtype_size == 4) {
-        std::cerr << "Inference mode: FP32\n";
+        std::cerr << "Inference mode : FP32\n";
         inference_mode = kFloat32;
     }
     else
@@ -392,7 +428,8 @@ void GPT2::load_from_file(const std::string &fname)
     segment_name.resize(segment_name_size);
     fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
     fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    if (show_load_info)
+        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     tokenizer = std::move(gten::GPT2Tokenizer(fin));
 
@@ -404,7 +441,8 @@ void GPT2::load_from_file(const std::string &fname)
     Tensor wte_weight({config_.n_vocab, config_.n_embed}, inference_mode);
     fin.read(wte_weight.data_ptr<char>(), segment_size);
     wte_ = gten::Embedding(inference_mode, wte_weight, config_.n_ctx);
-    // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    if (show_load_info)
+        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     // WPE
     fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
@@ -414,7 +452,8 @@ void GPT2::load_from_file(const std::string &fname)
     Tensor wpe_weight({config_.n_ctx, config_.n_embed}, inference_mode);
     fin.read(wpe_weight.data_ptr<char>(), segment_size);
     wpe_ = PosEmbedding(inference_mode, wpe_weight, config_.n_ctx);
-    // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    if (show_load_info)
+        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     // BLOCKS
     blocks_ = std::vector<ResidualAttentionBlock>();
@@ -425,7 +464,8 @@ void GPT2::load_from_file(const std::string &fname)
         segment_name.resize(segment_name_size);
         fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
         fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-        // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+        if (show_load_info)
+            std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
         Tensor qw({config_.n_embed, config_.n_embed}, inference_mode);
         Tensor qb({config_.n_embed}, inference_mode);
@@ -482,7 +522,8 @@ void GPT2::load_from_file(const std::string &fname)
     segment_name.resize(segment_name_size);
     fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
     fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    // std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    if (show_load_info)
+        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
 
     Tensor ln_fw({config_.n_embed}, inference_mode);
     Tensor ln_fb({config_.n_embed}, inference_mode);

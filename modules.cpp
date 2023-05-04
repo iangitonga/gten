@@ -1,21 +1,59 @@
-#include "modules.h"
-
 #include <cmath>
 #include <iostream>
+
+#include "utils.h"
+#include "modules.h"
+
+
+#define GTEN_CHECK_DTYPE_EQUAL(inp_dtype, expected_dtype)     \
+    GTEN_ASSERT(                                              \
+        inp_dtype == expected_dtype,                          \
+        "Expected tensor to have dtype=%s but got dtype=%s.", \
+        dtype_str(expected_dtype),                            \
+        dtype_str(inp_dtype))
+
+#define GTEN_CHECK_NDIMS_EQUAL(inp_ndims, expected_ndims)    \
+    GTEN_ASSERT(                                             \
+        inp_ndims == expected_ndims,                         \
+        "Expected a %d-dim tensor but got a %d-dim tensor.", \
+        expected_ndims,                                      \
+        inp_ndims)
+
+#define GTEN_CHECK_DIMSIZE_EQUAL(dim, inp_dimsize, expected_dimsize)  \
+    GTEN_ASSERT(                                                      \
+        inp_dimsize == expected_dimsize,                              \
+        "Expected tensor to have dim-%d=%d but got dim-%d=%d.",       \
+        dim, expected_dimsize, dim, inp_dimsize)
+
+#define GTEN_CHECK_INP_CTX_SIZE(inp_ctx_size, max_ctx_size)                  \
+    GTEN_ASSERT(                                                             \
+        inp_ctx_size <= max_ctx_size,                                        \
+        "The given input's context size=%d exceeds max context size of %d.", \
+        inp_ctx_size,                                                        \
+        max_ctx_size)
+
+
 
 namespace gten
 {
 
 Embedding::Embedding(InferenceMode mode, const Tensor& weight, int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), n_vocab_(weight.size(0)), max_ctx_(max_ctx),
-      n_embed_(weight.size(1)), emb_out_(Tensor({max_ctx_, n_embed_}, mode)),
+    : inference_mode_(mode), weight_(weight), n_vocab_(weight.size(0)),
+      max_ctx_(max_ctx), n_embed_(weight.size(1)),
+      emb_out_(Tensor({max_ctx_, n_embed_}, mode)),
       proj_out_(Tensor({1, n_vocab_}, kFloat32))
 {
+    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
 }
 
 Tensor Embedding::forward(const Tensor& inp)
 {
     Timer timer(&time_embed_ms_);
+
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), kInt32);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 1);
+    GTEN_CHECK_INP_CTX_SIZE(inp.numel(), max_ctx_);
 
     if (inference_mode_ == kFloat16)
         return forward_impl<Float16>(inp);
@@ -59,6 +97,10 @@ Tensor Embedding::forward_proj(const Tensor &inp)
 {
     Timer timer(&time_project_ms_);
 
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
+
     if (inference_mode_ == kFloat16)
         return forward_proj_impl<Float16>(inp);
     else
@@ -72,45 +114,35 @@ Tensor Embedding::forward_proj_impl(const Tensor& inp) {
     const scalar_t* inp_data = inp.data_ptr<scalar_t>();
     const scalar_t* weight_data = weight_.data_ptr<scalar_t>();
 
-    const int n_ctx = inp.size(0);
+    const int ctx_i = inp.size(0) - 1;
     const int n_embed = inp.size(1);
-    const int ctx_i = n_ctx - 1;
 
-#if GTEN_SIMD
     for (int emb_i = 0; emb_i < n_vocab_; emb_i++)
     {
-        Vec8_f32 dot_accum = { vec8_f32_setzero() };
-        for (int el = 0; el < n_embed; el += 8) {
-            Vec8_f32 iv = vec8_f32_load(inp_data + (ctx_i * n_embed + el));
-            Vec8_f32 wv = vec8_f32_load(weight_data + (emb_i * n_embed + el));
-            dot_accum = vec8_f32_fma(iv, wv, dot_accum);
+        Vec_f32x8 dot_accum = { vec_f32x8_setzero() };
+        for (int i = 0; i < n_embed; i += 8) {
+            Vec_f32x8 x = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
+            Vec_f32x8 w = vec_f32x8_load(weight_data + (emb_i * n_embed + i));
+            dot_accum = vec_f32x8_fma(x, w, dot_accum);
         }
-        out_data[emb_i] = vec8_f32_sum(dot_accum);
+        out_data[emb_i] = vec_f32x8_sum(dot_accum);
     }
-#else
-    for (int emb_i = 0; emb_i < n_vocab_; emb_i++)
-    {
-        Float32 dot_prod = 0.0f;
-        for (int el = 0; el < n_embed; el++) {
-            Float32 inp_w = fpcvt_to_fp32<scalar_t>(inp_data[ctx_i * n_embed + el]);
-            Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[emb_i * n_embed + el]);
-            dot_prod += inp_w * w;
-        }
-        out_data[emb_i] = dot_prod;
-    }
-#endif
 
     return proj_out_;  
 }
 
 PosEmbedding::PosEmbedding(InferenceMode mode, const Tensor &weight, int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), max_ctx_(max_ctx), n_embed_( weight.size(1)),
-      out_(Tensor({max_ctx, n_embed_}, mode))
+    : inference_mode_(mode), weight_(weight), max_ctx_(max_ctx),
+      n_embed_( weight.size(1)), out_(Tensor({max_ctx, n_embed_}, mode))
 {
+    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
 }
 
 Tensor PosEmbedding::forward(int32_t n_ctx)
 {
+    GTEN_CHECK_INP_CTX_SIZE(n_ctx, max_ctx_);
+
     Timer timer(&time_ms_);
     
     if (inference_mode_ == kFloat16)
@@ -145,15 +177,26 @@ Tensor PosEmbedding::forward_impl(int32_t n_ctx)
     return out_;
 }
 
-LayerNorm::LayerNorm(InferenceMode mode, const Tensor &weight, const Tensor &bias, int32_t max_ctx)
+LayerNorm::LayerNorm(InferenceMode mode,
+                     const Tensor &weight,
+                     const Tensor &bias,
+                     int32_t max_ctx)
     : inference_mode_(mode), weight_(weight), bias_(bias), max_ctx_(max_ctx),
       n_embed_(weight.size(0)), out_(Tensor({max_ctx, n_embed_}, mode))
 {
+    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
+    GTEN_CHECK_DTYPE_EQUAL(bias_.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 1);
+    GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
 
 Tensor LayerNorm::forward(const Tensor &inp)
 {
     Timer timer(&time_ms_);
+
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
 
     if (inference_mode_ == kFloat16)
         return forward_impl<Float16>(inp);
@@ -177,23 +220,25 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
         const int ctx_offset = (n_ctx - 1) * n_embed_;
         // Mean calculation.
         Float32 mean_accum = 0.0f;
-        for (int el = 0; el < n_embed_; el++)
-            mean_accum += fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]);
+        for (int i = 0; i < n_embed_; i++)
+            mean_accum += fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
         Float32 mean = mean_accum / (Float32)n_embed_;
 
         // Standard deviation calculation.
         Float32 variance_accum = 0.0f;
-        for (int el = 0; el < n_embed_; el++)
-            variance_accum += std::pow(fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]) - mean, 2);
+        for (int i = 0; i < n_embed_; i++) {
+            Float32 x = fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
+            variance_accum += std::pow(x - mean, 2);
+        }
         Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed_);
 
         // Normalization.
-        for (int el = 0; el < n_embed_; el++) {
-            Float32 unnormalized = fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]);
-            Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[el]);
-            Float32 b = fpcvt_to_fp32<scalar_t>(bias_data[el]);
+        for (int i = 0; i < n_embed_; i++) {
+            Float32 unnormalized = fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
+            Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[i]);
+            Float32 b = fpcvt_to_fp32<scalar_t>(bias_data[i]);
             Float32 normalized = ((unnormalized - mean) / (std_dev + eps_)) * w + b;
-            out_data[el + ctx_offset] = fpcvt_from_fp32<scalar_t>(normalized);
+            out_data[i + ctx_offset] = fpcvt_from_fp32<scalar_t>(normalized);
         }
     }
     else
@@ -206,24 +251,26 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
 
             // Mean calculation.
             Float32 mean_accum = 0.0f;
-            for (int el = 0; el < n_embed_; el++)
-                mean_accum += fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]);
+            for (int i = 0; i < n_embed_; i++)
+                mean_accum += fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
             Float32 mean = mean_accum / (Float32)n_embed_;
 
             // Standard deviation calculation.
             Float32 variance_accum = 0.0f;
-            for (int el = 0; el < n_embed_; el++)
-                variance_accum += std::pow(fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]) - mean, 2);
+            for (int i = 0; i < n_embed_; i++) {
+                Float32 x = fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
+                variance_accum += std::pow(x - mean, 2);
+            }
             Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed_);
 
             // Normalization.
-            for (int el = 0; el < n_embed_; el++) {
-                Float32 unnormalized = fpcvt_to_fp32<scalar_t>(inp_data[el + ctx_offset]);
-                Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[el]);
-                Float32 b = fpcvt_to_fp32<scalar_t>(bias_data[el]);
+            for (int i = 0; i < n_embed_; i++) {
+                Float32 x = fpcvt_to_fp32<scalar_t>(inp_data[i + ctx_offset]);
+                Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[i]);
+                Float32 b = fpcvt_to_fp32<scalar_t>(bias_data[i]);
                 // Epsilon added to standard deviation prevents div by zero.
-                Float32 normalized = ((unnormalized - mean) / (std_dev + eps_)) * w + b;
-                out_data[el + ctx_offset] = fpcvt_from_fp32<scalar_t>(normalized);
+                Float32 normalized = ((x - mean) / (std_dev + eps_)) * w + b;
+                out_data[i + ctx_offset] = fpcvt_from_fp32<scalar_t>(normalized);
             }
         }
     }
@@ -238,6 +285,10 @@ GELU::GELU(InferenceMode mode, int32_t max_ctx, int32_t n_out)
 Tensor GELU::forward(const Tensor &inp)
 {
     Timer timer(&time_ms_);
+
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_out_);
 
     if (inference_mode_ == kFloat16)
         return forward_impl<Float16>(inp);
@@ -260,8 +311,9 @@ Tensor GELU::forward_impl(const Tensor& inp)
         Float32 x;
         for (int i = start_i; i < ne; ++i) {
             x = fpcvt_to_fp32<scalar_t>(inp_data[i]);
-            Float32 res = 0.5 * x * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
-                                  * (x + 0.044715f * std::pow(x, 3.0f))));
+            Float32 res = 0.5 * x 
+                              * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
+                              * (x + 0.044715f * std::pow(x, 3.0f))));
             out_data[i] = fpcvt_from_fp32<scalar_t>(res);
         }
     }
@@ -270,8 +322,9 @@ Tensor GELU::forward_impl(const Tensor& inp)
         Float32 x;
         for (int i = 0; i < ne; ++i) {
             x = fpcvt_to_fp32<scalar_t>(inp_data[i]);
-            Float32 res = 0.5 * x * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
-                                  * (x + 0.044715f * std::pow(x, 3.0f))));
+            Float32 res = 0.5 * x 
+                              * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
+                              * (x + 0.044715f * std::pow(x, 3.0f))));
             out_data[i] = fpcvt_from_fp32<scalar_t>(res);
         }
     }
@@ -285,9 +338,16 @@ Residual::Residual(InferenceMode mode, int32_t max_ctx, int32_t n_embed)
 
 Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1)
 {
-    GTEN_ASSERT(inp0.numel() == inp1.numel(), "Addition of diff length tensors not allowed.");
-
     Timer timer(&time_ms_);
+
+    GTEN_CHECK_DTYPE_EQUAL(inp0.dtype(), inference_mode_);
+    GTEN_CHECK_DTYPE_EQUAL(inp1.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp0.ndims(), 2);
+    GTEN_CHECK_NDIMS_EQUAL(inp1.ndims(), 2);
+    GTEN_ASSERT(
+        inp0.shape() == inp1.shape(),
+        "Expected input tensor1 shape=(%d, %d) to be equal to tensor2 shape=(%d, %d).",
+        inp0.size(0), inp0.size(1), inp1.size(0), inp1.size(1));
 
     if (inference_mode_ == kFloat16)
         return forward_impl<Float16>(inp0, inp1);
@@ -306,62 +366,49 @@ Tensor Residual::forward_impl(const Tensor& inp0, const Tensor& inp1)
     const scalar_t* inp0_data = inp0.data_ptr<scalar_t>();
     const scalar_t* inp1_data = inp1.data_ptr<scalar_t>();
 
-#if GTEN_SIMD
     if (out_cached_)
     {
         uint32_t n_iter = n_embed;
         uint32_t offset = inp0.numel() - n_embed;
         for (uint32_t i = 0; i < n_iter; i += 8) {
-            Vec8_f32 v0 = vec8_f32_load(inp0_data + offset + i);
-            Vec8_f32 v1 = vec8_f32_load(inp1_data + offset + i);
-            Vec8_f32 res = vec8_f32_add(v0, v1);
-            vec8_f32_store(res, out_data + offset + i);
+            Vec_f32x8 x0 = vec_f32x8_load(inp0_data + offset + i);
+            Vec_f32x8 x1 = vec_f32x8_load(inp1_data + offset + i);
+            Vec_f32x8 x_sum = vec_f32x8_add(x0, x1);
+            vec_f32x8_store(x_sum, out_data + offset + i);
         }
     }
     else {
         out_cached_ = true;
         int n_iter = inp0.numel();
         for (int i = 0; i < n_iter; i += 8) {
-            Vec8_f32 v0 = vec8_f32_load(inp0_data + i);
-            Vec8_f32 v1 = vec8_f32_load(inp1_data + i);
-            Vec8_f32 res = vec8_f32_add(v0, v1);
-            vec8_f32_store(res, out_data + i);
+            Vec_f32x8 x0 = vec_f32x8_load(inp0_data + i);
+            Vec_f32x8 x1 = vec_f32x8_load(inp1_data + i);
+            Vec_f32x8 x_sum = vec_f32x8_add(x0, x1);
+            vec_f32x8_store(x_sum, out_data + i);
         }
     }
-#else
-    if (out_cached_)
-    {
-        int n_iter = n_embed;
-        int offset = inp0.numel() - n_embed;
-        for (int i = 0; i < n_iter; i++) {
-            Float32 inp0_w = fpcvt_to_fp32<scalar_t>(inp0_data[i + offset]);
-            Float32 inp1_w = fpcvt_to_fp32<scalar_t>(inp1_data[i + offset]);
-            out_data[i + offset] = fpcvt_from_fp32<scalar_t>(inp0_w + inp1_w);
-        }
-    }   
-    else {
-        out_cached_ = true;
-        int n_iter = inp0.numel();
-        for (int i = 0; i < n_iter; i++) {
-            Float32 inp0_w = fpcvt_to_fp32<scalar_t>(inp0_data[i]);
-            Float32 inp1_w = fpcvt_to_fp32<scalar_t>(inp1_data[i]);
-            out_data[i] = fpcvt_from_fp32<scalar_t>(inp0_w + inp1_w);
-        }
-    }
-#endif
-    
+
     return out_;
 }
 
-Linear::Linear(InferenceMode mode, const Tensor &weight, const Tensor &bias, int32_t max_ctx)
+Linear::Linear(InferenceMode mode, const Tensor &weight, const Tensor &bias,
+               int32_t max_ctx)
     : inference_mode_(mode), weight_(weight), bias_(bias),
       out_(Tensor({max_ctx, weight_.size(0)}, mode))
 {
+    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
+    GTEN_CHECK_DTYPE_EQUAL(bias_.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
+    GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
 
 Tensor Linear::forward(const Tensor &inp)
 {
     Timer timer(&time_ms_);
+
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight_.size(1));
 
     if (inference_mode_ == kFloat16)
         return forward_impl<Float16>(inp);
@@ -382,20 +429,18 @@ Tensor Linear::forward_impl(const Tensor& inp)
     const scalar_t* bias_data = bias_.data_ptr<scalar_t>();
     const scalar_t* inp_data = inp.data_ptr<scalar_t>();
 
-#if GTEN_SIMD
-
     if (out_cached_)
     {
         const int ctx_i = n_ctx - 1;
         for (int out_i = 0; out_i < n_out; out_i++) {
-            Vec8_f32 dot_prod_accum = vec8_f32_setzero();
-            for (int el = 0; el < n_embed; el += 8) {
-                Vec8_f32 iv = vec8_f32_load(inp_data + (ctx_i * n_embed + el));
-                Vec8_f32 wv = vec8_f32_load(weight_data + (out_i * n_embed + el));
-                dot_prod_accum = vec8_f32_fma(iv, wv, dot_prod_accum);
+            Vec_f32x8 dot_accum = vec_f32x8_setzero();
+            for (int i = 0; i < n_embed; i += 8) {
+                Vec_f32x8 x0 = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
+                Vec_f32x8 x1 = vec_f32x8_load(weight_data + (out_i * n_embed + i));
+                dot_accum = vec_f32x8_fma(x0, x1, dot_accum);
             }
             Float32 bias = fpcvt_to_fp32<scalar_t>(bias_data[out_i]);
-            Float32 res =  vec8_f32_sum(dot_prod_accum) + bias;
+            Float32 res =  vec_f32x8_sum(dot_accum) + bias;
             out_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<scalar_t>(res);
         }
     }
@@ -404,66 +449,29 @@ Tensor Linear::forward_impl(const Tensor& inp)
         out_cached_ = true;
         for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++) {
             for (int out_i = 0; out_i < n_out; out_i++) {
-                Vec8_f32 dot_prod_accum = vec8_f32_setzero();
-                for (int el = 0; el < n_embed; el += 8) {
-                    Vec8_f32 iv = vec8_f32_load(inp_data + (ctx_i * n_embed + el));
-                    Vec8_f32 wv = vec8_f32_load(weight_data + (out_i * n_embed + el));
-                    dot_prod_accum = vec8_f32_fma(iv, wv, dot_prod_accum);
+                Vec_f32x8 dot_accum = vec_f32x8_setzero();
+                for (int i = 0; i < n_embed; i += 8) {
+                    Vec_f32x8 x0 = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
+                    Vec_f32x8 x1 = vec_f32x8_load(weight_data + (out_i * n_embed + i));
+                    dot_accum = vec_f32x8_fma(x0, x1, dot_accum);
                 }
                 Float32 bias = fpcvt_to_fp32<scalar_t>(bias_data[out_i]);
-                Float32 res =  vec8_f32_sum(dot_prod_accum) + bias;
+                Float32 res =  vec_f32x8_sum(dot_accum) + bias;
                 out_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<scalar_t>(res);
             }
         }
     }
 
-#else
-
-    if (out_cached_)
-    {
-        const int ctx_i = n_ctx - 1;
-        for (int out_i = 0; out_i < n_out; out_i++) {
-            Float32 dot_prod = 0.0f;
-            for (int el = 0; el < n_embed; el++) {
-                Float32 inp_w = fpcvt_to_fp32<scalar_t>(inp_data[ctx_i * n_embed + el]);
-                Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[out_i * n_embed + el]);
-                dot_prod += inp_w * w;
-            }
-            Float32 bias = fpcvt_to_fp32<scalar_t>(bias_data[out_i]);
-            out_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<scalar_t>(dot_prod + bias);
-        }
-    }
-    else
-    {
-        out_cached_ = true;
-        for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++) {
-            for (int out_i = 0; out_i < n_out; out_i++) {
-                Float32 dot_prod = 0.0f;
-                for (int el = 0; el < n_embed; el++) {
-                    Float32 inp_w = fpcvt_to_fp32<scalar_t>(inp_data[ctx_i * n_embed + el]);
-                    Float32 w = fpcvt_to_fp32<scalar_t>(weight_data[out_i * n_embed + el]);
-                    dot_prod += inp_w * w;
-                }
-                Float32 bias = fpcvt_to_fp32<scalar_t>(bias_data[out_i]);
-                out_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<scalar_t>(dot_prod + bias);
-            }
-        }
-    }
-
-#endif
-
     return out_;
 }
 
-MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode,
-                                     const Linear& query,
-                                     const Linear& key,
-                                     const Linear& value,
-                                     const Linear& out_proj,
-                                     int32_t max_ctx,
-    int32_t n_embed, int32_t n_head)
-    : inference_mode_(mode), query_(query), key_(key), value_(value), qkv_proj_(out_proj),
-      n_head_(n_head), qk_cache_(Tensor({n_head, max_ctx, max_ctx}, mode)),
+MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode, const Linear& query,
+                                     const Linear& key, const Linear& value,
+                                     const Linear& out_proj, int32_t max_ctx,
+                                     int32_t n_embed, int32_t n_head)
+    : inference_mode_(mode), query_(query), key_(key), value_(value),
+      qkv_proj_(out_proj), n_head_(n_head),
+      qk_cache_(Tensor({n_head, max_ctx, max_ctx}, mode)),
       qkv_cache_(Tensor({max_ctx, n_embed}, mode))
 {
     if (mode == kFloat16) {
@@ -481,8 +489,14 @@ MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode,
     }
 }
 
+static int count = 0;
+
 Tensor MultiHeadSelfAttn::forward(const Tensor &inp)
 {
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), qkv_cache_.size(1));
+
     const int n_ctx = inp.size(0);
     const int n_embed = inp.size(1);
 
@@ -523,15 +537,17 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
         {
             const int q_row = n_ctx - 1;
             for (int k_col = 0; k_col < n_ctx; k_col++) {
-                Float32 dot_prod = 0.0f;
-                for (int el = 0; el < d_head; el++) {
-                    int q_idx = head * d_head + q_row * n_embed + el;
-                    int k_idx = head * d_head + k_col * n_embed + el;
-                    Float32 q_w = fpcvt_to_fp32<scalar_t>(q_data[q_idx]);
-                    Float32 k_w = fpcvt_to_fp32<scalar_t>(k_data[k_idx]);
-                    dot_prod += q_w * k_w * scale_factor;
+                Vec_f32x8 dot_accum = vec_f32x8_setzero();
+                for (int i = 0; i < d_head; i += 8) {
+                    int q_i = head * d_head + q_row * n_embed + i;
+                    int k_i = head * d_head + k_col * n_embed + i;
+                    Vec_f32x8 qw = vec_f32x8_load(q_data + q_i);
+                    Vec_f32x8 kw = vec_f32x8_load(k_data + k_i);
+                    dot_accum = vec_f32x8_add(vec_f32x8_mul(qw, kw), dot_accum);
                 }
-                qk_data[head * n_ctx * n_ctx + q_row * n_ctx + k_col] = fpcvt_from_fp32<scalar_t>(dot_prod);
+                Float32 dot_prod = vec_f32x8_sum(dot_accum) * scale_factor;
+                int qk_data_i = head * n_ctx * n_ctx + q_row * n_ctx + k_col;
+                qk_data[qk_data_i] = fpcvt_from_fp32<scalar_t>(dot_prod);
             }
         }
 
@@ -540,24 +556,25 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
         {
             const int row = n_ctx - 1;
             const int base_i = head * n_ctx * n_ctx + row * n_ctx;
+
             Float32 max = -INFINITY;
-            for (int el = 0; el < n_ctx; el++) {
-                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[base_i + el]);
+            for (int i = 0; i < n_ctx; i++) {
+                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[base_i + i]);
                 if (val > max)
                     max = val;
             }
 
             Float32 sum_exp = 0;
-            for (int el = 0; el < n_ctx; el++) {
-                int idx = base_i + el;
-                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[idx]);
-                qk_data[idx] = fpcvt_from_fp32<scalar_t>(std::exp(val - max));
-                sum_exp += fpcvt_to_fp32<scalar_t>(qk_data[idx]);
+            for (int i = 0; i < n_ctx; i++) {
+                int qk_i = base_i + i;
+                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
+                qk_data[qk_i] = fpcvt_from_fp32<scalar_t>(std::exp(val - max));
+                sum_exp += fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
             }
 
-            for (int el = 0; el < n_ctx; el++) {
-                Float32 qk_w = fpcvt_to_fp32<scalar_t>(qk_data[base_i + el]);
-                qk_data[base_i + el] = fpcvt_from_fp32<scalar_t>(qk_w / sum_exp);
+            for (int i = 0; i < n_ctx; i++) {
+                Float32 qkw = fpcvt_to_fp32<scalar_t>(qk_data[base_i + i]);
+                qk_data[base_i + i] = fpcvt_from_fp32<scalar_t>(qkw / sum_exp);
             }
         }
 
@@ -567,14 +584,15 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
             const int qk_row = n_ctx - 1;
             for (int v_col = 0; v_col < d_head; v_col++) {
                 Float32 dot_prod = 0;
-                for (int el = 0; el < n_ctx; el++) {
-                    int qk_idx = head * n_ctx * n_ctx + qk_row * n_ctx + el;
-                    int v_idx = head * d_head + el * n_embed + v_col;
-                    Float32 qk_w = fpcvt_to_fp32<scalar_t>(qk_data[qk_idx]);
-                    Float32 v_w = fpcvt_to_fp32<scalar_t>(v_data[v_idx]);
-                    dot_prod += qk_w * v_w;
+                for (int i = 0; i < n_ctx; i++) {
+                    int qk_i = head * n_ctx * n_ctx + qk_row * n_ctx + i;
+                    int v_i = head * d_head + i * n_embed + v_col;
+                    Float32 qkw = fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
+                    Float32 vw = fpcvt_to_fp32<scalar_t>(v_data[v_i]);
+                    dot_prod += qkw * vw;
                 }
-                qkv_data[head * d_head + qk_row * n_embed + v_col] = fpcvt_from_fp32<scalar_t>(dot_prod);
+                int qkv_data_i = head * d_head + qk_row * n_embed + v_col;
+                qkv_data[qkv_data_i] = fpcvt_from_fp32<scalar_t>(dot_prod);
             }
         }
     }
@@ -587,19 +605,21 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
         {
             for (int q_row = 0; q_row < n_ctx; q_row++)
             {
-                // `non_masked_prods` represents the number of dot products that will not be masked
-                // and therefore must be computed. This allows us to skip unecessary dot products.
+                // `non_masked_prods` represents the number of dot products that will
+                // not be masked and therefore must be computed. This allows us to skip
+                // unecessary dot products.
                 int non_masked_prods = q_row + 1;
                 for (int k_col = 0; k_col < non_masked_prods; k_col++) {
-                    Float32 dot_prod = 0.0f;
-                    for (int el = 0; el < d_head; el++) {
-                        int q_idx = head * d_head + q_row * n_embed + el;
-                        int k_idx = head * d_head + k_col * n_embed + el;
-                        Float32 q_w = fpcvt_to_fp32<scalar_t>(q_data[q_idx]);
-                        Float32 k_w = fpcvt_to_fp32<scalar_t>(k_data[k_idx]);
-                        dot_prod += q_w * k_w * scale_factor;
+                    Float32 dot_accum = 0.0f;
+                    for (int i = 0; i < d_head; i++) {
+                        int q_i = head * d_head + q_row * n_embed + i;
+                        int k_i = head * d_head + k_col * n_embed + i;
+                        Float32 qw = fpcvt_to_fp32<scalar_t>(q_data[q_i]);
+                        Float32 kw = fpcvt_to_fp32<scalar_t>(k_data[k_i]);
+                        dot_accum += qw * kw * scale_factor;
                     }
-                    qk_data[head * n_ctx * n_ctx + q_row * n_ctx + k_col] = fpcvt_from_fp32<scalar_t>(dot_prod);
+                    int qk_data_i = head * n_ctx * n_ctx + q_row * n_ctx + k_col;
+                    qk_data[qk_data_i] = fpcvt_from_fp32<scalar_t>(dot_accum);
                 }
 
             }
@@ -610,23 +630,23 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
         for (int row = 0; row < n_rows; row++)
         {
             Float32 max = -INFINITY;
-            for (int el = 0; el < n_ctx; el++) {
-                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[row * n_ctx + el]);
-                if (val > max)
-                    max = val;
+            for (int i = 0; i < n_ctx; i++) {
+                Float32 x = fpcvt_to_fp32<scalar_t>(qk_data[row * n_ctx + i]);
+                if (x > max)
+                    max = x;
             }
 
             Float32 sum_exp = 0;
-            for (int el = 0; el < n_ctx; el++) {
-                int idx = row * n_ctx + el;
-                Float32 val = fpcvt_to_fp32<scalar_t>(qk_data[idx]);
-                qk_data[idx] = fpcvt_from_fp32<scalar_t>(std::exp(val - max));
-                sum_exp += fpcvt_to_fp32<scalar_t>(qk_data[idx]);
+            for (int i = 0; i < n_ctx; i++) {
+                int qk_i = row * n_ctx + i;
+                Float32 x = fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
+                qk_data[qk_i] = fpcvt_from_fp32<scalar_t>(std::exp(x - max));
+                sum_exp += fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
             }
 
-            for (int el = 0; el < n_ctx; el++) {
-                Float32 qk_w =  fpcvt_to_fp32<scalar_t>(qk_data[row * n_ctx + el]);
-                qk_data[row * n_ctx + el] = fpcvt_from_fp32<scalar_t>(qk_w / sum_exp);
+            for (int i = 0; i < n_ctx; i++) {
+                Float32 qkw =  fpcvt_to_fp32<scalar_t>(qk_data[row * n_ctx + i]);
+                qk_data[row * n_ctx + i] = fpcvt_from_fp32<scalar_t>(qkw / sum_exp);
             }
         }
 
@@ -636,14 +656,15 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
             for (int qk_row = 0; qk_row < n_ctx; qk_row++){
                 for (int v_col = 0; v_col < d_head; v_col++) {
                     Float32 dot_prod = 0;
-                    for (int el = 0; el < n_ctx; el++) {
-                        int qk_idx = head * n_ctx * n_ctx + qk_row * n_ctx + el;
-                        int v_idx = head * d_head + el * n_embed + v_col;
-                        Float32 qk_w =fpcvt_to_fp32<scalar_t>(qk_data[qk_idx]);
-                        Float32 v_w = fpcvt_to_fp32<scalar_t>(v_data[v_idx]);
-                        dot_prod += qk_w * v_w;
+                    for (int i = 0; i < n_ctx; i++) {
+                        int qk_i = head * n_ctx * n_ctx + qk_row * n_ctx + i;
+                        int v_i = head * d_head + i * n_embed + v_col;
+                        Float32 qkw =fpcvt_to_fp32<scalar_t>(qk_data[qk_i]);
+                        Float32 vw = fpcvt_to_fp32<scalar_t>(v_data[v_i]);
+                        dot_prod += qkw * vw;
                     }
-                    qkv_data[head * d_head + qk_row * n_embed + v_col] = fpcvt_from_fp32<scalar_t>(dot_prod);
+                    int qkv_data_i = head * d_head + qk_row * n_embed + v_col;
+                    qkv_data[qkv_data_i] = fpcvt_from_fp32<scalar_t>(dot_prod);
                 }
             }
         }
@@ -653,14 +674,9 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
 }
 
 ResidualAttentionBlock::ResidualAttentionBlock(InferenceMode mode,
-                                               const MultiHeadSelfAttn &attn,
-                                               const LayerNorm &ln_1,
-                                               const Linear &mlp_fc,
-                                               const Linear &mlp_proj,
-                                               const LayerNorm &ln_2,
-                                               const GELU &gelu,
-                                               int32_t max_ctx,
-                                               int32_t n_embed)
+    const MultiHeadSelfAttn &attn, const LayerNorm &ln_1, const Linear &mlp_fc,
+    const Linear &mlp_proj, const LayerNorm &ln_2, const GELU &gelu, int32_t max_ctx,
+    int32_t n_embed)
     : attn_(attn), ln_1_(ln_1), mlp_fc_(mlp_fc), mlp_proj_(mlp_proj), ln_2_(ln_2),
       gelu_(gelu), inp_res_(Residual(mode, max_ctx, n_embed)),
       attn_res_(Residual(mode, max_ctx, n_embed))
@@ -670,7 +686,8 @@ ResidualAttentionBlock::ResidualAttentionBlock(InferenceMode mode,
 Tensor ResidualAttentionBlock::forward(const Tensor &inp)
 {
     Tensor attn = inp_res_.forward(inp, attn_.forward(ln_1_.forward(inp)));
-    Tensor out = attn_res_.forward(attn, mlp_proj_.forward(gelu_.forward(mlp_fc_.forward(ln_2_.forward(attn)))));
+    Tensor out = attn_res_.forward(attn,
+        mlp_proj_.forward(gelu_.forward(mlp_fc_.forward(ln_2_.forward(attn)))));
     return out;
 }
 
