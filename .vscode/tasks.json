@@ -8,7 +8,6 @@
                 "-fdiagnostics-color=always",
                 "-O0",
                 // "-ffast-math",
-                // "-mavx",
                 "-g",
                 "${workspaceFolder}/*.cpp",
                 "-o",

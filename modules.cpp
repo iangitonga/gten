@@ -37,28 +37,13 @@
 namespace gten
 {
 
-Embedding::Embedding(InferenceMode mode, const Tensor& weight, int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), n_vocab_(weight.size(0)),
-      max_ctx_(max_ctx), n_embed_(weight.size(1)),
-      emb_out_(Tensor({max_ctx_, n_embed_}, mode)),
-      proj_out_(Tensor({1, n_vocab_}, kFloat32))
+Embedding::Embedding(const Tensor& weight, AcvConfig acv, int32_t max_ctx)
+    : weight_{weight}, n_vocab_{weight.size(0)},
+      max_ctx_{max_ctx}, n_embed_{weight.size(1)},
+      emb_out_{Tensor{{max_ctx_, n_embed_}, acv.dtype, acv.scale, acv.zerop}},
+      proj_out_{Tensor{{1, n_vocab_}, kFloat32}}
 {
-    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
     GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
-}
-
-Tensor Embedding::forward(const Tensor& inp)
-{
-    Timer timer(&time_embed_ms_);
-
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), kInt32);
-    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 1);
-    GTEN_CHECK_INP_CTX_SIZE(inp.numel(), max_ctx_);
-
-    if (inference_mode_ == kFloat16)
-        return forward_impl<Float16>(inp);
-    else
-        return forward_impl<Float32>(inp);
 }
 
 template<typename scalar_t>
@@ -80,8 +65,7 @@ Tensor Embedding::forward_impl(const Tensor& inp)
         emb_out_cached_ = true;
 
         const int ntokens = inp.numel();
-        for (int token_i = 0; token_i < ntokens; token_i++)
-        {
+        for (int token_i = 0; token_i < ntokens; token_i++) {
             int emb_i = inp_data[token_i] * n_embed_;
             void *src = reinterpret_cast<void*>(weight_data + emb_i);
             void *dest = reinterpret_cast<void*>(out_data + token_i * n_embed_);
@@ -92,19 +76,49 @@ Tensor Embedding::forward_impl(const Tensor& inp)
     return emb_out_;    
 }
 
-
-Tensor Embedding::forward_proj(const Tensor &inp)
+template<>
+Tensor Embedding::forward_impl<Qint8>(const Tensor& inp)
 {
-    Timer timer(&time_project_ms_);
+    emb_out_.resize({inp.numel(), n_embed_});
+    Float32* out_data = emb_out_.data_ptr<Float32>();
+    const Int32* inp_data = inp.data_ptr<Int32>();
+    Qint8* weight_data = weight_.data_ptr<Qint8>();
 
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
-    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
+    if (emb_out_cached_) {
+        const int token_i = inp.numel() - 1;
+        const int emb_i = inp_data[token_i] * n_embed_;
+        for (int i = 0; i < n_embed_; i++)
+            out_data[token_i * n_embed_ + i] = weight_.deq(weight_data[emb_i + i]);
+    }
+    else {
+        emb_out_cached_ = true;
 
-    if (inference_mode_ == kFloat16)
-        return forward_proj_impl<Float16>(inp);
+        const int ntokens = inp.numel();
+        for (int token_i = 0; token_i < ntokens; token_i++)
+        {
+            int emb_i = inp_data[token_i] * n_embed_;
+            for (int i = 0; i < n_embed_; i++)
+                out_data[token_i * n_embed_ + i] = weight_.deq(weight_data[emb_i + i]);
+        }
+    }
+
+    return emb_out_;    
+}
+
+Tensor Embedding::forward(const Tensor& inp)
+{
+    Timer timer{&time_embed_ms_};
+
+    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), kInt32);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 1);
+    GTEN_CHECK_INP_CTX_SIZE(inp.numel(), max_ctx_);
+
+    if (weight_.dtype() == kQint8)
+        return forward_impl<Qint8>(inp);
+    else if (weight_.dtype() == kFloat16)
+        return forward_impl<Float16>(inp);
     else
-        return forward_proj_impl<Float32>(inp);
+        return forward_impl<Float32>(inp);
 }
 
 template<typename scalar_t>
@@ -131,24 +145,51 @@ Tensor Embedding::forward_proj_impl(const Tensor& inp) {
     return proj_out_;  
 }
 
-PosEmbedding::PosEmbedding(InferenceMode mode, const Tensor &weight, int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), max_ctx_(max_ctx),
-      n_embed_( weight.size(1)), out_(Tensor({max_ctx, n_embed_}, mode))
-{
-    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
-    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
+template<>
+Tensor Embedding::forward_proj_impl<Qint8>(const Tensor& inp) {
+    // Output probs must be float32.
+    Float32* out_data = proj_out_.data_ptr<Float32>();
+    const Float32* inp_data = inp.data_ptr<Float32>();
+    const Qint8* weight_data = weight_.data_ptr<Qint8>();
+
+    const int ctx_i = inp.size(0) - 1;
+    const int n_embed = inp.size(1);
+
+    for (int emb_i = 0; emb_i < n_vocab_; emb_i++)
+    {
+        Float32 dot_accum = 0.0f;
+        for (int i = 0; i < n_embed; i += 1) {
+            Float32 x = inp_data[ctx_i * n_embed + i];
+            Float32 w = weight_.deq(weight_data[emb_i * n_embed + i]);
+            dot_accum += x * w;
+        }
+        out_data[emb_i] = dot_accum;
+    }
+
+    return proj_out_;  
 }
 
-Tensor PosEmbedding::forward(int32_t n_ctx)
+Tensor Embedding::forward_proj(const Tensor &inp)
 {
-    GTEN_CHECK_INP_CTX_SIZE(n_ctx, max_ctx_);
+    Timer timer(&time_project_ms_);
 
-    Timer timer(&time_ms_);
-    
-    if (inference_mode_ == kFloat16)
-        return forward_impl<Float16>(n_ctx);
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
+
+    if (weight_.dtype() == kQint8)
+        return forward_proj_impl<Qint8>(inp);
+    else if (weight_.dtype() == kFloat16)
+        return forward_proj_impl<Float16>(inp);
     else
-        return forward_impl<Float32>(n_ctx);
+        return forward_proj_impl<Float32>(inp);
+}
+
+PosEmbedding::PosEmbedding(const Tensor &weight, AcvConfig acv, int32_t max_ctx)
+    : weight_{weight}, max_ctx_{max_ctx},
+      n_embed_{weight.size(1)},
+      out_{Tensor{{max_ctx, n_embed_}, acv.dtype, acv.scale, acv.zerop}}
+{
+    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
 }
 
 template<typename scalar_t>
@@ -177,32 +218,51 @@ Tensor PosEmbedding::forward_impl(int32_t n_ctx)
     return out_;
 }
 
-LayerNorm::LayerNorm(InferenceMode mode,
-                     const Tensor &weight,
-                     const Tensor &bias,
-                     int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), bias_(bias), max_ctx_(max_ctx),
-      n_embed_(weight.size(0)), out_(Tensor({max_ctx, n_embed_}, mode))
+template<>
+Tensor PosEmbedding::forward_impl<Qint8>(int32_t n_ctx)
 {
-    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
-    GTEN_CHECK_DTYPE_EQUAL(bias_.dtype(), inference_mode_);
+    out_.resize({n_ctx, n_embed_});
+    Float32* out_data = out_.data_ptr<Float32>();
+    const Qint8* weight_data = weight_.data_ptr<Qint8>();
+
+    if (out_cached_) {
+        const int data_offset = (n_ctx - 1) * n_embed_;
+        for (int i = 0; i < n_embed_; i++)
+            out_data[data_offset + i] = weight_.deq(weight_data[data_offset + i]);
+    }
+    else {
+        out_cached_ = true;
+
+        for (int i = 0; i <  n_ctx * n_embed_; i++)
+            out_data[i] = weight_.deq(weight_data[i]);
+    }
+    return out_;
+}
+
+Tensor PosEmbedding::forward(int32_t n_ctx)
+{
+    GTEN_CHECK_INP_CTX_SIZE(n_ctx, max_ctx_);
+
+    Timer timer{&time_ms_};
+    
+    if (weight_.dtype() == kQint8)
+        return forward_impl<Qint8>(n_ctx);
+    else if (weight_.dtype() == kFloat16)
+        return forward_impl<Float16>(n_ctx);
+    else
+        return forward_impl<Float32>(n_ctx);
+}
+
+LayerNorm::LayerNorm(const Tensor &weight, const Tensor &bias, AcvConfig acv,
+                     int32_t max_ctx)
+    : weight_{weight}, bias_{bias}, max_ctx_{max_ctx},
+      n_embed_{weight.size(0)},
+      out_{Tensor{{max_ctx, n_embed_}, acv.dtype, acv.scale, acv.zerop}}
+{
     GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 1);
     GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
 
-Tensor LayerNorm::forward(const Tensor &inp)
-{
-    Timer timer(&time_ms_);
-
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
-    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
-
-    if (inference_mode_ == kFloat16)
-        return forward_impl<Float16>(inp);
-    else
-        return forward_impl<Float32>(inp);
-}
 
 template<typename scalar_t>
 Tensor LayerNorm::forward_impl(const Tensor &inp)
@@ -277,23 +337,99 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
     return out_;
 }
 
-GELU::GELU(InferenceMode mode, int32_t max_ctx, int32_t n_out)
-    : inference_mode_(mode), n_out_(n_out), out_(Tensor({max_ctx, n_out_}, mode))
+
+template<>
+Tensor LayerNorm::forward_impl<Qint8>(const Tensor &inp)
 {
+    out_.resize(inp.shape());
+    Float32* out_data = out_.data_ptr<Float32>();
+    const Float32* inp_data = inp.data_ptr<Float32>();
+    const Qint8* weight_data = weight_.data_ptr<Qint8>();
+    const Float32* bias_data = bias_.data_ptr<Float32>();
+
+    const int n_ctx = inp.size(0);
+
+    if (out_cached_)
+    {
+        const int ctx_offset = (n_ctx - 1) * n_embed_;
+        // Mean calculation.
+        Float32 mean_accum = 0.0f;
+        for (int i = 0; i < n_embed_; i++)
+            mean_accum += inp_data[i + ctx_offset];
+        Float32 mean = mean_accum / (Float32)n_embed_;
+
+        // Standard deviation calculation.
+        Float32 variance_accum = 0.0f;
+        for (int i = 0; i < n_embed_; i++) {
+            Float32 x = inp_data[i + ctx_offset];
+            variance_accum += std::pow(x - mean, 2);
+        }
+        Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed_);
+
+        // Normalization.
+        for (int i = 0; i < n_embed_; i++) {
+            Float32 unnormalized = inp_data[i + ctx_offset];
+            Float32 w = weight_.deq(weight_data[i]);
+            Float32 b = bias_data[i];
+            Float32 normalized = ((unnormalized - mean) / (std_dev + eps_)) * w + b;
+            out_data[i + ctx_offset] = normalized;
+        }
+    }
+    else
+    {
+        out_cached_ = true;
+
+        for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++)
+        {
+            const int ctx_offset = ctx_i * n_embed_;
+
+            // Mean calculation.
+            Float32 mean_accum = 0.0f;
+            for (int i = 0; i < n_embed_; i++)
+                mean_accum += inp_data[i + ctx_offset];
+            Float32 mean = mean_accum / (Float32)n_embed_;
+
+            // Standard deviation calculation.
+            Float32 variance_accum = 0.0f;
+            for (int i = 0; i < n_embed_; i++) {
+                Float32 x = inp_data[i + ctx_offset];
+                variance_accum += std::pow(x - mean, 2);
+            }
+            Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed_);
+
+            // Normalization.
+            for (int i = 0; i < n_embed_; i++) {
+                Float32 x = inp_data[i + ctx_offset];
+                Float32 w = weight_.deq(weight_data[i]);
+                Float32 b = bias_data[i];
+                // Epsilon added to standard deviation prevents div by zero.
+                Float32 normalized = ((x - mean) / (std_dev + eps_)) * w + b;
+                out_data[i + ctx_offset] = normalized;
+            }
+        }
+    }
+    return out_;
 }
 
-Tensor GELU::forward(const Tensor &inp)
+Tensor LayerNorm::forward(const Tensor &inp)
 {
     Timer timer(&time_ms_);
 
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_out_);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed_);
 
-    if (inference_mode_ == kFloat16)
+    if (weight_.dtype() == kQint8)
+        return forward_impl<Qint8>(inp);
+    else if (weight_.dtype() == kFloat16)
         return forward_impl<Float16>(inp);
     else
         return forward_impl<Float32>(inp);
+}
+
+
+GELU::GELU(AcvConfig acv, int32_t max_ctx, int32_t n_out)
+    : n_out_{n_out}, out_{Tensor{{max_ctx, n_out_}, acv.dtype, acv.scale, acv.zerop}}
+{
 }
 
 template <typename scalar_t>
@@ -331,17 +467,32 @@ Tensor GELU::forward_impl(const Tensor& inp)
     return out_;
 }
 
-Residual::Residual(InferenceMode mode, int32_t max_ctx, int32_t n_embed)
-    : inference_mode_(mode), out_(Tensor({max_ctx, n_embed}, mode))
+
+Tensor GELU::forward(const Tensor& inp)
+{
+    Timer timer{&time_ms_};
+
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_out_);
+
+    if (out_.dtype() == kQint8)
+        return forward_impl<Float32>(inp);
+    else if (out_.dtype() == kFloat16)
+        return forward_impl<Float16>(inp);
+    else
+        return forward_impl<Float32>(inp);
+}
+
+Residual::Residual(AcvConfig acv, int32_t max_ctx, int32_t n_embed)
+    : out_{Tensor{{max_ctx, n_embed}, acv.dtype, acv.scale, acv.zerop}}
 {
 }
 
 Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1)
 {
-    Timer timer(&time_ms_);
+    Timer timer{&time_ms_};
 
-    GTEN_CHECK_DTYPE_EQUAL(inp0.dtype(), inference_mode_);
-    GTEN_CHECK_DTYPE_EQUAL(inp1.dtype(), inference_mode_);
+    GTEN_CHECK_DTYPE_EQUAL(inp0.dtype(), inp1.dtype());
     GTEN_CHECK_NDIMS_EQUAL(inp0.ndims(), 2);
     GTEN_CHECK_NDIMS_EQUAL(inp1.ndims(), 2);
     GTEN_ASSERT(
@@ -349,7 +500,9 @@ Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1)
         "Expected input tensor1 shape=(%d, %d) to be equal to tensor2 shape=(%d, %d).",
         inp0.size(0), inp0.size(1), inp1.size(0), inp1.size(1));
 
-    if (inference_mode_ == kFloat16)
+    if (out_.dtype() == kQint8)
+        return forward_impl<Float32>(inp0, inp1);
+    else if (out_.dtype() == kFloat16)
         return forward_impl<Float16>(inp0, inp1);
     else
         return forward_impl<Float32>(inp0, inp1);
@@ -391,30 +544,15 @@ Tensor Residual::forward_impl(const Tensor& inp0, const Tensor& inp1)
     return out_;
 }
 
-Linear::Linear(InferenceMode mode, const Tensor &weight, const Tensor &bias,
+Linear::Linear(const Tensor &weight, const Tensor &bias, AcvConfig acv,
                int32_t max_ctx)
-    : inference_mode_(mode), weight_(weight), bias_(bias),
-      out_(Tensor({max_ctx, weight_.size(0)}, mode))
+    : weight_{weight}, bias_{bias},
+      out_{Tensor{{max_ctx, weight_.size(0)}, acv.dtype, acv.scale, acv.zerop}}
 {
-    GTEN_CHECK_DTYPE_EQUAL(weight_.dtype(), inference_mode_);
-    GTEN_CHECK_DTYPE_EQUAL(bias_.dtype(), inference_mode_);
     GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
     GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
 
-Tensor Linear::forward(const Tensor &inp)
-{
-    Timer timer(&time_ms_);
-
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
-    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight_.size(1));
-
-    if (inference_mode_ == kFloat16)
-        return forward_impl<Float16>(inp);
-    else
-        return forward_impl<Float32>(inp);
-}
 
 template<typename scalar_t>
 Tensor Linear::forward_impl(const Tensor& inp)
@@ -465,16 +603,80 @@ Tensor Linear::forward_impl(const Tensor& inp)
     return out_;
 }
 
-MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode, const Linear& query,
-                                     const Linear& key, const Linear& value,
-                                     const Linear& out_proj, int32_t max_ctx,
-                                     int32_t n_embed, int32_t n_head)
-    : inference_mode_(mode), query_(query), key_(key), value_(value),
-      qkv_proj_(out_proj), n_head_(n_head),
-      qk_cache_(Tensor({n_head, max_ctx, max_ctx}, mode)),
-      qkv_cache_(Tensor({max_ctx, n_embed}, mode))
+
+template<>
+Tensor Linear::forward_impl<Qint8>(const Tensor& inp)
 {
-    if (mode == kFloat16) {
+    const int n_ctx = inp.size(0);
+    const int n_embed = inp.size(1);
+    const int n_out = weight_.size(0);
+    
+    out_.resize({n_ctx, n_out});
+    Float32* out_data = out_.data_ptr<Float32>();
+    const Qint8* weight_data = weight_.data_ptr<Qint8>();
+    const Float32* bias_data = bias_.data_ptr<Float32>();
+    const Float32* inp_data = inp.data_ptr<Float32>();
+
+    if (out_cached_)
+    {
+        const int ctx_i = n_ctx - 1;
+        for (int out_i = 0; out_i < n_out; out_i++) {
+            Float32 dot_accum = 0.0f;
+            for (int i = 0; i < n_embed; i += 1) {
+                Float32 x0 = inp_data[ctx_i * n_embed + i];
+                Float32 x1 = weight_.deq(weight_data[out_i * n_embed + i]);
+                dot_accum += x0 * x1;
+            }
+            Float32 bias = bias_data[out_i];
+            Float32 res =  dot_accum + bias;
+            out_data[ctx_i * n_out + out_i] = res;
+        }
+    }
+    else
+    {
+        out_cached_ = true;
+        for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++) {
+            for (int out_i = 0; out_i < n_out; out_i++) {
+                Float32 dot_accum = 0.0f;
+                for (int i = 0; i < n_embed; i += 1) {
+                    Float32 x0 = inp_data[ctx_i * n_embed + i];
+                    Float32 x1 = weight_.deq(weight_data[out_i * n_embed + i]);
+                    dot_accum += x0 * x1;
+                }
+                Float32 bias = bias_data[out_i];
+                Float32 res =  dot_accum + bias;
+                out_data[ctx_i * n_out + out_i] = res;
+            }
+        }
+    }
+
+    return out_;
+}
+
+Tensor Linear::forward(const Tensor &inp)
+{
+    Timer timer{&time_ms_};
+
+    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight_.size(1));
+
+    if (weight_.dtype() == kQint8)
+        return forward_impl<Qint8>(inp);
+    else if (weight_.dtype() == kFloat16)
+        return forward_impl<Float16>(inp);
+    else
+        return forward_impl<Float32>(inp);
+}
+
+MultiHeadSelfAttn::MultiHeadSelfAttn(const Linear& query, const Linear& key,
+                                     const Linear& value, const Linear& out_proj,
+                                     AcvConfig acv, int32_t max_ctx,
+                                     int32_t n_embed, int32_t n_head)
+    : query_{query}, key_{key}, value_{value}, qkv_proj_{out_proj}, n_head_{n_head},
+      qkv_cache_{Tensor{{max_ctx, n_embed}, acv.dtype, acv.scale, acv.zerop}}
+{
+    if (acv.dtype == kFloat16) {
+        qk_cache_ = Tensor({n_head, max_ctx, max_ctx}, kFloat16);
         Float16 *qk_cache_data = qk_cache_.data_ptr<Float16>();
         const int ne = qk_cache_.numel();
         const Float16 inf = fp32_to_fp16(-INFINITY);
@@ -482,6 +684,7 @@ MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode, const Linear& query,
             qk_cache_data[i] = inf;
     }
     else {
+        qk_cache_ = Tensor({n_head, max_ctx, max_ctx}, kFloat32);
         Float32 *qk_cache_data = qk_cache_.data_ptr<Float32>();
         const int ne = qk_cache_.numel();
         for (int i = 0; i < ne; i++)
@@ -489,11 +692,8 @@ MultiHeadSelfAttn::MultiHeadSelfAttn(InferenceMode mode, const Linear& query,
     }
 }
 
-static int count = 0;
-
 Tensor MultiHeadSelfAttn::forward(const Tensor &inp)
 {
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), inference_mode_);
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
     GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), qkv_cache_.size(1));
 
@@ -504,7 +704,7 @@ Tensor MultiHeadSelfAttn::forward(const Tensor &inp)
     Tensor k = key_.forward(inp);
     Tensor v = value_.forward(inp);
 
-    const Tensor qkv = (inference_mode_ == kFloat16)
+    const Tensor qkv = (q.dtype() == kFloat16)
                        ? qkv_attn<Float16>(q, k, v) : qkv_attn<Float32>(q, k, v);
     const Tensor out = qkv_proj_.forward(qkv);
     return out;
@@ -673,13 +873,17 @@ Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tenso
     return qkv_cache_;
 }
 
-ResidualAttentionBlock::ResidualAttentionBlock(InferenceMode mode,
-    const MultiHeadSelfAttn &attn, const LayerNorm &ln_1, const Linear &mlp_fc,
-    const Linear &mlp_proj, const LayerNorm &ln_2, const GELU &gelu, int32_t max_ctx,
-    int32_t n_embed)
-    : attn_(attn), ln_1_(ln_1), mlp_fc_(mlp_fc), mlp_proj_(mlp_proj), ln_2_(ln_2),
-      gelu_(gelu), inp_res_(Residual(mode, max_ctx, n_embed)),
-      attn_res_(Residual(mode, max_ctx, n_embed))
+ResidualAttentionBlock::ResidualAttentionBlock(const MultiHeadSelfAttn& attn,
+                                               const LayerNorm& ln_1,
+                                               const Linear& mlp_fc,
+                                               const Linear& mlp_proj,
+                                               const LayerNorm& ln_2,
+                                               const GELU& gelu,
+                                               const Residual& inp_res,
+                                               const Residual& attn_res,
+                                               int32_t max_ctx, int32_t n_embed)
+    : attn_{attn}, ln_1_{ln_1}, mlp_fc_{mlp_fc}, mlp_proj_{mlp_proj}, ln_2_{ln_2},
+      gelu_{gelu}, inp_res_{inp_res}, attn_res_{attn_res}
 {
 }
 

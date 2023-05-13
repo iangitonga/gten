@@ -2,9 +2,5 @@ A list of features to be added.
 
 - Quantization.
 - Support -xl model.
-
 - Testing.
-- Allow generation of arbitrary-length string.
-- Memory debuginfo.
-- Build flags, AVX and non-avx flags.
-- Better model Tensors loading structure.
+- Allow generation of arbitrary-length documents.

@@ -39,7 +39,7 @@ int main(int argc, char const *argv[])
     std::string model_name = "Gpt2-medium";
     std::string inference_mode = "f16";
     double temperature = 0.9;
-    int gen_tokens = 250;
+    int gen_tokens = 1000;
     bool debug = false;
     for (int i = 1; i < argc; i++)
     {
@@ -60,6 +60,9 @@ int main(int argc, char const *argv[])
         }
         else if (arg == "-f32") {
             inference_mode = "f32";
+        }
+        else if (arg == "-q8") {
+            inference_mode = "q8";
         }
         else if (arg == "-debug") {
             debug = true;
@@ -127,6 +130,8 @@ int main(int argc, char const *argv[])
     std::string model_dir = std::string("models/") + model_name + ".fp16.gten";;
     if (inference_mode == "f32")
         model_dir = std::string("models/") + model_name + ".fp32.gten";
+    else if (inference_mode == "q8")
+        model_dir = std::string("models/") + model_name + ".q8.gten";
 
     if (debug) {
         std::cout << "Model name     : " << model_name << "\n";
@@ -142,7 +147,6 @@ int main(int argc, char const *argv[])
 
     return 0;
 }
-
 
 
 GPT2::GPT2(const std::string &fname, bool show_load_info)
@@ -343,32 +347,140 @@ void GPT2::show_performance(int64_t niter) const
     std::cout << "Loading        | " << std::setw(3) << ""                    << "   | " << time_load_ms_   << "ms\n";
     std::cout << "--------------------------------------\n";
     std::cout << "TOTAL          | " << std::setw(3) << total/niter    << "ms | " << total << "ms\n";
-    std::cout << "--------------------------------------\n\n";
+    std::cout << "--------------------------------------\n";
+    std::cout << "TOTAL MEMORY   : " << gten::Tensor::total_memory_allocated / 1000000 << "MB\n";
+    std::cout << "--------------------------------------\n";
 }
 
-/** File format.
- * The GPT2 gten file format is designed to be simple and minimal. We pack vocab,
- * config and layer weight data in a single binary file. The different sections have
- * names to allow for debugging.
+/** Gpt2 Model Binary format.
  * 
- *  number |     section       | size in bytes
- *  ------------------------------------------
- *    1    |      magic        | 8
- *    2    |  dtype_byte_size  | 8
- *    2    |     n_vocab       | 8
- *    3    |      n_ctx        | 8
- *    4    |     n_embed       | 8
- *    5    |     n_layer       | 8
- *    6    |      n_head       | 8
+ * Key:
+ *    <LABEL> = LABEL occupies 4 bytes in the binary.
+ *    {LABEL: SIZE} = LABEL occupies SIZE bytes.
  * 
- * for section in [vocab, wte, wpe, block_0, ... block_{n_layer-1}, ln_f]
+ * FORMAT:
+ * {GTEN_magic_number: 8} = GTENFILE in ascii.
+ * <n_vocab>
+ * <max_ctx>
+ * <n_embed>
+ * <n_layer>
+ * <n_head>
+ * <size_vocab_idname>
+ * {vocab_idname: size_vocab_idname}
+ * <size_vocab>
+ * {vocab: size_vocab}
+ *
+ * for layer in (wte, wpe, block_0, ... block_N, ln_f)
+ *     [block_name_size]. Not included for wte, wpe and ln_f.
+ *     [block_name]. Not included for wte, wpe and ln_f.
+ *     <layer_name_size>
+ *     <layer_name>
+ *     <activation_dtype_size>
+ *     <activation_scale: 4bytes, zerop: 4bytes> // Weight quantization params. Ignore if
+ *     <weight_name_size>                        // activation_dtype_size != 1.
+ *     <weight_name>
+ *     <weight_dtype_size>
+ *     <weight_scale: 4bytes, weight_zerop: 4bytes> // Weight quantization params. Ignore
+ *     <weight_nbytes>                              // if weight_dtype_size != 1.
+ *     <weight_bytes>
  * 
- *    _    | section_name_size | 8
- *    _    | section name      | section_name_size
- *    _    | section_data_size | 8
- *    _    | section_data      | section_data_size
- *  -------------------------------------------
+ *     if layer.has_bias:
+ *         <b_name_size>
+ *         <b_name>
+ *         <b_dtype_size>
+ *         <b_scale: 4bytes, wi_zerop: 4bytes>
+ *         <b_nbytes>
+ *         <b_bytes>
 */
+
+static inline void read_block_header(std::ifstream& fin, bool debug = false)
+{
+    std::string block_name;
+    int32_t block_name_size;
+    fin.read(reinterpret_cast<char*>(&block_name_size), sizeof(block_name_size));
+    block_name.resize(block_name_size);
+    fin.read(reinterpret_cast<char*>(block_name.data()), block_name_size);
+
+    if (debug)
+        std::cout << "\n" << "Reading block: " << block_name << "\n";
+}
+
+static inline gten::AcvConfig read_layer_header(std::ifstream& fin, bool debug = false) {
+    std::string layer_name;
+    int32_t layer_name_size;
+    fin.read(reinterpret_cast<char*>(&layer_name_size), sizeof(layer_name_size));
+    layer_name.resize(layer_name_size);
+    fin.read(reinterpret_cast<char*>(layer_name.data()), layer_name_size);
+
+    int32_t activ_dsize;
+    float activ_scale;
+    int32_t activ_zerop;
+    fin.read(reinterpret_cast<char*>(&activ_dsize), sizeof(activ_dsize));
+    fin.read(reinterpret_cast<char*>(&activ_scale), sizeof(activ_scale));
+    fin.read(reinterpret_cast<char*>(&activ_zerop), sizeof(activ_zerop));
+
+    if (debug)
+        std::cout << "Layer: "   << layer_name
+                  << " [activ_dsize="  << activ_dsize
+                  << ", activ_scale=" << activ_scale
+                  << ", activ_zerop=" << activ_zerop
+                  << "]\n";
+
+    gten::Dtype dtype;
+    if (activ_dsize == 1)
+        dtype = gten::kQint8;
+    else if (activ_dsize == 2)
+        dtype = gten::kFloat16;
+    else if (activ_dsize == 4)
+        dtype = gten::kFloat32;
+    else
+        GTEN_ASSERT(false, "Unknown weight dsize: %d\n", activ_dsize);
+    return gten::AcvConfig{dtype, activ_scale, activ_zerop};
+}
+
+static inline gten::Tensor read_weight(std::ifstream& fin, const std::vector<int>& shape, bool debug = false) {
+    std::string weight_name;
+    int32_t weight_name_size;
+    fin.read(reinterpret_cast<char*>(&weight_name_size), sizeof(weight_name_size));
+    weight_name.resize(weight_name_size);
+    fin.read(reinterpret_cast<char*>(weight_name.data()), weight_name_size);
+
+    int32_t weight_dsize;
+    float weight_scale;
+    int32_t weight_zerop;
+    int32_t weight_payload_size;
+    fin.read(reinterpret_cast<char*>(&weight_dsize), sizeof(weight_dsize));
+    fin.read(reinterpret_cast<char*>(&weight_scale), sizeof(weight_scale));
+    fin.read(reinterpret_cast<char*>(&weight_zerop), sizeof(weight_zerop));
+    fin.read(reinterpret_cast<char*>(&weight_payload_size), sizeof(weight_payload_size));
+
+    if (debug)
+        std::cout << "     ~ "   << weight_name
+                  << " (" << weight_payload_size
+                  << ")[dsize="  << weight_dsize
+                  << ", scale=" << weight_scale
+                  << ", zerop=" << weight_zerop
+                  << "]\n";
+
+    gten::Dtype dtype;
+    if (weight_dsize == 1)
+        dtype = gten::kQint8;
+    else if (weight_dsize == 2)
+        dtype = gten::kFloat16;
+    else if (weight_dsize == 4)
+        dtype = gten::kFloat32;
+    else
+        GTEN_ASSERT(false, "Unknown weight dsize: %d\n", weight_dsize);
+
+    gten::Tensor tensor{shape, dtype, weight_scale, weight_zerop};
+    GTEN_ASSERT(
+        weight_payload_size == tensor.nbytes(),
+        "Weight `%s` data size: %ld does not match the expected size: %d.",
+        weight_name.c_str(), tensor.nbytes(), weight_payload_size);
+    fin.read(tensor.data_ptr<char>(), weight_payload_size);
+
+    return tensor;
+}
 
 void GPT2::load_from_file(const std::string &fname, bool show_load_info)
 {
@@ -381,155 +493,120 @@ void GPT2::load_from_file(const std::string &fname, bool show_load_info)
         std::cout << "Loading from   : " << fname.c_str() << "\n";
     gten::Timer timer(&time_load_ms_);
 
+    // Magic number.
     int64_t magic;
     fin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     GTEN_ASSERT(magic == magic_number_, "Magic number in file %s does not match the expected one.\n", fname.c_str());
-
-    int64_t weights_dtype_size;
-    fin.read(reinterpret_cast<char*>(&weights_dtype_size), sizeof(weights_dtype_size));
-    if (show_load_info)
-        std::cout << "FP mode size   : " << weights_dtype_size << " bytes\n";
-    InferenceMode inference_mode;
-    if (weights_dtype_size == 2) {
-        inference_mode = kFloat16;
-        std::cerr << "Inference mode : FP16\n";
-    }
-    else if (weights_dtype_size == 4) {
-        std::cerr << "Inference mode : FP32\n";
-        inference_mode = kFloat32;
-    }
-    else
-        GTEN_ASSERT(false, "Unknown weight dtype size: %ld", weights_dtype_size);
     
+    // Model config.
     config_ = GPT2Config();
-    // We could just read the data in the config directly but the config stores
-    // the data in int32_t type while the data in the input file is in int64_t type.
-    // Changing the config data types to int64_t causes a lot of narrowing
-    // conversions in modules.cpp. The solution to this is to promote all usage
-    // of int32 to int64.
-    int64_t temp_config_value;
-    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
-    config_.n_vocab = static_cast<int32_t>(temp_config_value);
-    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
-    config_.n_ctx = static_cast<int32_t>(temp_config_value);
-    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
-    config_.n_embed = static_cast<int32_t>(temp_config_value);
-    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
-    config_.n_layer = static_cast<int32_t>(temp_config_value);
-    fin.read(reinterpret_cast<char*>(&temp_config_value), sizeof(temp_config_value));
-    config_.n_head = static_cast<int32_t>(temp_config_value);
+    fin.read(reinterpret_cast<char*>(&config_), sizeof(config_));
     std::cout << config_;
 
     // Vocab
-    std::string segment_name;
-    int64_t segment_name_size;
-    int64_t segment_size;
-    fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
-    segment_name.resize(segment_name_size);
-    fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
-    fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
+    std::string vocab_segment_name;
+    int32_t vocab_segment_name_size;
+    int32_t vocab_segment_size;
+    fin.read(reinterpret_cast<char*>(&vocab_segment_name_size), sizeof(vocab_segment_name_size));
+    vocab_segment_name.resize(vocab_segment_name_size);
+    fin.read(reinterpret_cast<char*>(vocab_segment_name.data()), vocab_segment_name_size);
+    fin.read(reinterpret_cast<char*>(&vocab_segment_size), sizeof(vocab_segment_size));
     if (show_load_info)
-        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+        std::cout << "Read segment: [" << vocab_segment_name << "](" << vocab_segment_size << " bytes)\n";
 
+    // Tokenizer.
     tokenizer = std::move(gten::GPT2Tokenizer(fin));
 
     // WTE
-    fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
-    segment_name.resize(segment_name_size);
-    fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
-    fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    Tensor wte_weight({config_.n_vocab, config_.n_embed}, inference_mode);
-    fin.read(wte_weight.data_ptr<char>(), segment_size);
-    wte_ = gten::Embedding(inference_mode, wte_weight, config_.n_ctx);
-    if (show_load_info)
-        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    AcvConfig wte_acv_config = read_layer_header(fin, show_load_info);
+    Tensor wte_weight = read_weight(fin, {config_.n_vocab, config_.n_embed}, show_load_info);
+    wte_ = gten::Embedding{wte_weight, wte_acv_config, config_.n_ctx};
 
     // WPE
-    fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
-    segment_name.resize(segment_name_size);
-    fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
-    fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    Tensor wpe_weight({config_.n_ctx, config_.n_embed}, inference_mode);
-    fin.read(wpe_weight.data_ptr<char>(), segment_size);
-    wpe_ = PosEmbedding(inference_mode, wpe_weight, config_.n_ctx);
-    if (show_load_info)
-        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+    AcvConfig wpe_acv_config = read_layer_header(fin, show_load_info);
+    Tensor wpe_weight = read_weight(fin, {config_.n_ctx, config_.n_embed}, show_load_info);
+    wpe_ = PosEmbedding{wpe_weight, wpe_acv_config, config_.n_ctx};
+
+    // (WTE + WPE) residual layer.
+    AcvConfig res_acv_config = read_layer_header(fin, show_load_info);
+    res_ = Residual{res_acv_config, config_.n_ctx, config_.n_embed};
 
     // BLOCKS
     blocks_ = std::vector<ResidualAttentionBlock>();
     blocks_.reserve(config_.n_layer);
     for (int64_t i = 0; i < config_.n_layer; i++)
     {
-        fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
-        segment_name.resize(segment_name_size);
-        fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
-        fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-        if (show_load_info)
-            std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
+        read_block_header(fin, show_load_info);
 
-        Tensor qw({config_.n_embed, config_.n_embed}, inference_mode);
-        Tensor qb({config_.n_embed}, inference_mode);
-        Tensor kw({config_.n_embed, config_.n_embed}, inference_mode);
-        Tensor kb({config_.n_embed}, inference_mode);
-        Tensor vw({config_.n_embed, config_.n_embed}, inference_mode);
-        Tensor vb({config_.n_embed}, inference_mode);
-        Tensor attn_projw({config_.n_embed, config_.n_embed}, inference_mode);
-        Tensor attn_projb({config_.n_embed}, inference_mode);
-        Tensor ln_1w({config_.n_embed}, inference_mode);
-        Tensor ln_1b({config_.n_embed}, inference_mode);
-        Tensor mlp_fcw({4 * config_.n_embed, config_.n_embed}, inference_mode);
-        Tensor mlp_fcb({4 * config_.n_embed}, inference_mode);
-        Tensor mlp_projw({config_.n_embed, 4 * config_.n_embed}, inference_mode);
-        Tensor mlp_projb({config_.n_embed}, inference_mode);
-        Tensor ln_2w({config_.n_embed}, inference_mode);
-        Tensor ln_2b({config_.n_embed}, inference_mode);           
+        // Query projection layer.
+        const AcvConfig q_acv_config = read_layer_header(fin, show_load_info);
+        Tensor qw = read_weight(fin, {config_.n_embed, config_.n_embed}, show_load_info);
+        Tensor qb = read_weight(fin, {config_.n_embed}, show_load_info);
+        Linear query{qw, qb, q_acv_config, config_.n_ctx};
 
-        fin.read(qw.data_ptr<char>(),         qw.numel()         * qw.itemsize());
-        fin.read(qb.data_ptr<char>(),         qb.numel()         * qb.itemsize());
-        fin.read(kw.data_ptr<char>(),         kw.numel()         * kw.itemsize());
-        fin.read(kb.data_ptr<char>(),         kb.numel()         * kb.itemsize());
-        fin.read(vw.data_ptr<char>(),         vw.numel()         * vw.itemsize());
-        fin.read(vb.data_ptr<char>(),         vb.numel()         * vb.itemsize());
-        fin.read(attn_projw.data_ptr<char>(), attn_projw.numel() * attn_projw.itemsize());
-        fin.read(attn_projb.data_ptr<char>(), attn_projb.numel() * attn_projb.itemsize());
-        fin.read(ln_1w.data_ptr<char>(),      ln_1w.numel()      * ln_1w.itemsize());
-        fin.read(ln_1b.data_ptr<char>(),      ln_1b.numel()      * ln_1b.itemsize());
-        fin.read(mlp_fcw.data_ptr<char>(),    mlp_fcw.numel()    * mlp_fcw.itemsize());
-        fin.read(mlp_fcb.data_ptr<char>(),    mlp_fcb.numel()    * mlp_fcb.itemsize());
-        fin.read(mlp_projw.data_ptr<char>(),  mlp_projw.numel()  * mlp_projw.itemsize());
-        fin.read(mlp_projb.data_ptr<char>(),  mlp_projb.numel()  * mlp_projb.itemsize());
-        fin.read(ln_2w.data_ptr<char>(),      ln_2w.numel()      * ln_2w.itemsize());
-        fin.read(ln_2b.data_ptr<char>(),      ln_2b.numel()      * ln_2b.itemsize());
+        // Key projection layer.
+        const AcvConfig k_acv_config = read_layer_header(fin, show_load_info);
+        Tensor kw = read_weight(fin, {config_.n_embed, config_.n_embed}, show_load_info);
+        Tensor kb = read_weight(fin, {config_.n_embed}, show_load_info);
+        Linear key{kw, kb, k_acv_config, config_.n_ctx};
 
-        Linear query(inference_mode, qw, qb, config_.n_ctx);
-        Linear key(inference_mode, kw, kb, config_.n_ctx);
-        Linear value(inference_mode, vw, vb, config_.n_ctx);
-        Linear out_proj(inference_mode, attn_projw, attn_projb, config_.n_ctx);
+        // Value projection layer.
+        const AcvConfig v_acv_config = read_layer_header(fin, show_load_info);
+        Tensor vw = read_weight(fin, {config_.n_embed, config_.n_embed}, show_load_info);
+        Tensor vb = read_weight(fin, {config_.n_embed}, show_load_info);
+        Linear value{vw, vb, v_acv_config, config_.n_ctx};
 
-        MultiHeadSelfAttn self_attn(inference_mode, query, key, value, out_proj, config_.n_ctx, config_.n_embed, config_.n_head);
-        LayerNorm ln_1(inference_mode, ln_1w, ln_1b, config_.n_ctx);
-        Linear mlp_fc(inference_mode, mlp_fcw, mlp_fcb, config_.n_ctx);
-        Linear mlp_proj(inference_mode, mlp_projw, mlp_projb, config_.n_ctx);
-        LayerNorm ln_2(inference_mode, ln_2w, ln_2b, config_.n_ctx);
-        GELU gelu(inference_mode, config_.n_ctx, config_.n_embed * 4);
+        // QKV_out projection layer.
+        const AcvConfig attn_proj_acv_config = read_layer_header(fin, show_load_info);
+        Tensor attn_projw = read_weight(fin, {config_.n_embed, config_.n_embed}, show_load_info);
+        Tensor attn_projb = read_weight(fin, {config_.n_embed}, show_load_info);
+        Linear out_proj{attn_projw, attn_projb, attn_proj_acv_config, config_.n_ctx};
 
-        ResidualAttentionBlock bl(inference_mode, self_attn, ln_1, mlp_fc, mlp_proj, ln_2, gelu, config_.n_ctx, config_.n_embed);
+        // Input layernorm.
+        const AcvConfig ln_1_acv_config = read_layer_header(fin, show_load_info);
+        Tensor ln_1w = read_weight(fin, {config_.n_embed}, show_load_info);
+        Tensor ln_1b = read_weight(fin, {config_.n_embed}, show_load_info);
+        LayerNorm ln_1{ln_1w, ln_1b, ln_1_acv_config, config_.n_ctx};
+
+        // MLP fully-connected layer.
+        const AcvConfig mlp_fc_acv_config = read_layer_header(fin, show_load_info);
+        Tensor mlp_fcw = read_weight(fin, {4 * config_.n_embed, config_.n_embed}, show_load_info);
+        Tensor mlp_fcb = read_weight(fin, {4 * config_.n_embed}, show_load_info);
+        Linear mlp_fc{mlp_fcw, mlp_fcb, mlp_fc_acv_config, config_.n_ctx};
+
+        // MLP out projection layer.
+        const AcvConfig mlp_proj_acv_config = read_layer_header(fin, show_load_info);
+        Tensor mlp_projw = read_weight(fin, {config_.n_embed, 4 * config_.n_embed}, show_load_info);
+        Tensor mlp_projb = read_weight(fin, {config_.n_embed}, show_load_info);
+        Linear mlp_proj{mlp_projw, mlp_projb, mlp_proj_acv_config, config_.n_ctx};
+
+        // Attention layernorm.
+        const AcvConfig ln_2_acv_config = read_layer_header(fin, show_load_info);
+        Tensor ln_2w = read_weight(fin, {config_.n_embed}, show_load_info);
+        Tensor ln_2b = read_weight(fin, {config_.n_embed}, show_load_info);
+        LayerNorm ln_2{ln_2w, ln_2b, ln_2_acv_config, config_.n_ctx};
+
+        // Multihead self attn activ & GELU activ.
+        AcvConfig self_attn_acv_config = read_layer_header(fin, show_load_info);
+        MultiHeadSelfAttn self_attn{query, key, value, out_proj, self_attn_acv_config, config_.n_ctx, config_.n_embed, config_.n_head};
+
+        // GELU.
+        AcvConfig gelu_acv_config = read_layer_header(fin, show_load_info);
+        GELU gelu{gelu_acv_config, config_.n_ctx, config_.n_embed * 4};
+
+        // Attn inp residual.
+        AcvConfig inp_res_acv_config = read_layer_header(fin, show_load_info);
+        Residual inp_res{inp_res_acv_config, config_.n_ctx, config_.n_embed};
+        AcvConfig attn_res_acv_config = read_layer_header(fin, show_load_info);
+        Residual attn_res{attn_res_acv_config, config_.n_ctx, config_.n_embed};
+
+        ResidualAttentionBlock bl(self_attn, ln_1, mlp_fc, mlp_proj, ln_2, gelu, inp_res, attn_res, config_.n_ctx, config_.n_embed);
         blocks_.push_back(std::move(bl));
     }
     
-    // LN_F
-    fin.read(reinterpret_cast<char*>(&segment_name_size), sizeof(segment_name_size));
-    segment_name.resize(segment_name_size);
-    fin.read(reinterpret_cast<char*>(segment_name.data()), segment_name_size);
-    fin.read(reinterpret_cast<char*>(&segment_size), sizeof(segment_size));
-    if (show_load_info)
-        std::cout << "Reading segment: [" << segment_name << "](" << segment_size << " bytes)\n";
-
-    Tensor ln_fw({config_.n_embed}, inference_mode);
-    Tensor ln_fb({config_.n_embed}, inference_mode);
-    fin.read(ln_fw.data_ptr<char>(), ln_fw.numel() * ln_fw.itemsize());
-    fin.read(ln_fb.data_ptr<char>(), ln_fb.numel() * ln_fb.itemsize());
-
-    ln_f_ = LayerNorm(inference_mode, ln_fw, ln_fb, config_.n_ctx);
-    res_ = Residual(inference_mode, config_.n_ctx, config_.n_embed);
+    // Block output Layernorm.
+    const AcvConfig ln_f_acv_config = read_layer_header(fin, show_load_info);
+    Tensor ln_fw = read_weight(fin, {config_.n_embed}, show_load_info);
+    Tensor ln_fb = read_weight(fin, {config_.n_embed}, show_load_info);
+    ln_f_ = LayerNorm{ln_fw, ln_fb, ln_f_acv_config, config_.n_ctx};
 }

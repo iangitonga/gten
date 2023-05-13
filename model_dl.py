@@ -41,11 +41,14 @@ def _download_model(url, model_path):
 def download_model(model_name, inference_mode):
     if inference_mode == "f16":
         model_path = os.path.join("models", f"{model_name}.fp16.gten")
+    elif inference_mode == "q8":
+        model_path = os.path.join("models", f"{model_name}.q8.gten")
     else:
         model_path = os.path.join("models", f"{model_name}.fp32.gten")
     if os.path.exists(model_path):
         return
     os.makedirs("models", exist_ok=True)
+    # TODO: ADD Q8 URL.
     model_url_key = f"{model_name}.fp16" if inference_mode == "f16" else f"{model_name}.fp32"
     _download_model(MODELS_URLS[model_url_key], model_path)
 
@@ -54,7 +57,7 @@ if len(sys.argv) < 3 or sys.argv[1] not in MODELS:
     print("Model not specified.\n")
     print("usage: model_registry.py MODEL INFERENCE_MODE")
     print("MODEL is one of (Gpt2, Gpt2-medium, Gpt2-large)")
-    print("INFERENCE_MODE is one of (f16, f32)")
+    print("INFERENCE_MODE is one of (f16, f32, q8)")
 
 
 try:

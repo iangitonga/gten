@@ -1,9 +1,9 @@
 # gten
-**gten** is a simple transformer neural-network library to run transformer inference on CPU. It
+**gten** is a minimal library to run transformer neural network inference on CPU. It
 is implemented entirely in C++ and does not require any external dependencies. It contains
-modules that can be combined to create and run transformers as fast as PyTorch on CPUs. It
-supports inference in FP16(default) and FP32.**gten's** development is inspired by PyTorch
-and [ggml](https://github.com/ggerganov/ggml).
+modules that can be combined to create and run transformers as fast as PyTorch on CPUs and
+supports inference in FP16(default), FP32 and Qint8(weights-only).**gten's** development is
+inspired by PyTorch and [ggml](https://github.com/ggerganov/ggml).
 
 
 ## Install and Run GPT-2 using gten.

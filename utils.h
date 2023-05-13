@@ -79,18 +79,18 @@ struct Vec_f32x8 {
 };
 
 static Float32* init_cache() {
-    // TODO: Use smart ptr? 
+    // This is a memory leak because we never delete the cache but its not a problem
+    // because we want the cache to last the entire lifetime of the program.
     Float32* cache = new Float32[65536];
     Float16 idx = 0;
-    for (int i = 0; i < 65536; i++)
-    {
+    for (int i = 0; i < 65536; i++) {
         cache[i] = fp16_to_fp32(idx);
         idx += 1;
     }
     return cache;
 }
 
-// Global cache to avoid recomputations.
+// Global lookup table to avoid recomputations.
 static const Float32* G_fp16_to_fp32_cache = init_cache();
 
 inline Vec_f32x8 vec_f32x8_load(const Float16* src_ptr) {

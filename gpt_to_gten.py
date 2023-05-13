@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from tqdm import tqdm
 
 
@@ -117,92 +118,185 @@ GTEN_MAGIC_NUMBER = 0x454c49464e455447
 BYTEORDER = "little"
 
 
-def itob(integer):
-    return int.to_bytes(integer, 8, BYTEORDER)
+def itob(integer, width=4):
+    return int.to_bytes(integer, width, BYTEORDER)
 
 def btoi(bytes_):
     return int.from_bytes(bytes_, BYTEORDER)
 
-def tensor_to_file(tensor, file_obj, fpsize, expected_size):
-    assert (fpsize == 2 or fpsize == 4), f"Unsupported datasize: {fpsize}"
-    tensor = tensor.flatten().to(torch.float16) if fpsize == 2 else tensor.flatten().to(torch.float32)
-    # A list of bytes as integers.
-    tensor_bytes = tensor.detach().numpy().tobytes()
-    assert len(tensor_bytes) == expected_size
-    file_obj.write(itob(len(tensor_bytes)))
-    # byteorder issue?
-    file_obj.write(tensor_bytes)
+
+class Qparams:
+    def __init__(self, scale: float, zero_point: int):
+        self.s_bytes = np.array([scale], dtype=np.float32).tobytes()
+        self.z_bytes = np.array([zero_point], dtype=np.int32).tobytes()
+
+DEFAULT_QPARAMS = Qparams(0.0, 0)
+
+def quantize_weight(weight):
+    aq, bq = -128, 127
+    a, b = weight.min(), weight.max()
+    scale = (b-a)/(bq-aq)
+    zero_point = int((b*aq - a*bq)/(b-a))
+    qtensor = np.round(weight * 1/scale) + zero_point
+    qtensor = np.clip(qtensor, a_min=aq, a_max=bq).astype(np.int8)
+    qparams = Qparams(scale, zero_point)
+    return qtensor, qparams
 
 
-def test_converted(fname, model, dtype_size):
-    print(f"Testing conversion of: {fname}")
-    with open(fname, "rb") as f:
-        magic = f.read(8)
-        assert btoi(magic) == GTEN_MAGIC_NUMBER
-        _dtype_size = f.read(8)
-        assert btoi(_dtype_size) == dtype_size
-        n_vocab = f.read(8)
-        assert btoi(n_vocab) == model.config.n_vocab
-        n_ctx = f.read(8)
-        assert btoi(n_ctx) == model.config.n_ctx
-        n_state = f.read(8)
-        assert btoi(n_state) == model.config.n_state
-        n_layer = f.read(8)
-        assert btoi(n_layer) == model.config.n_layer
-        n_head = f.read(8)
-        assert btoi(n_head) == model.config.n_head
+def write_layer(fout, name, activ_size, activ_qparams, weights_size, w0, bias):
+    name = name.encode()
+    # <layer_name_size, layer_name>
+    fout.write(itob(len(name)))
+    fout.write(name)
 
-        block_names = [f"block_{i}".encode() for i in range(model.config.n_layer)]
-        segment_names = [b"vocab", b"wte", b"wpe", *block_names, b"ln_f"]
+    # Activations
+    # <act_name_size, act_qs, act_qz>
+    fout.write(itob(activ_size))
+    fout.write(activ_qparams.s_bytes)
+    fout.write(activ_qparams.z_bytes)
 
-        for segment_name in segment_names:
-            segment_name_size = btoi(f.read(8))
-            assert segment_name_size == len(segment_name)
-            assert f.read(segment_name_size) == segment_name
-            segment_size = btoi(f.read(8))
-            f.seek(segment_size, os.SEEK_CUR)
-    print("Testing successfull!!!")
+    # W0
+    if w0 is not None:
+        w0_name = f"{name.decode()}.weight".encode()
+        fout.write(itob(len(w0_name)))
+        fout.write(w0_name)
+        fout.write(itob(weights_size))
+        w0 = w0.detach().numpy().flatten()
+        w0_qparams = DEFAULT_QPARAMS
+        if weights_size == 1:
+            w0, w0_qparams = quantize_weight(w0)
+        elif weights_size == 2:
+            w0 = w0.astype(np.float16)
+        else:
+            w0 = w0.astype(np.float32)
+        fout.write(w0_qparams.s_bytes)
+        fout.write(w0_qparams.z_bytes)
+        w0_bytes = w0.tobytes()
+        fout.write(itob(len(w0_bytes)))
+        fout.write(w0_bytes)
+
+    # Bias
+    if bias is not None:
+        # NOTE: We do not quantize biases.
+        bias_name = f"{name.decode()}.bias".encode()
+        fout.write(itob(len(bias_name)))
+        fout.write(bias_name)
+        bias_size = 2 if weights_size == 2 else 4
+        fout.write(itob(bias_size))
+
+        bias = bias.detach().numpy().flatten()
+        bias_qparams = DEFAULT_QPARAMS
+        if weights_size == 2:
+            bias = bias.astype(np.float16)
+        else:
+            bias = bias.astype(np.float32)
+
+        fout.write(bias_qparams.s_bytes)
+        fout.write(bias_qparams.z_bytes)
+        bias_bytes = bias.tobytes()
+        fout.write(itob(len(bias_bytes)))
+        fout.write(bias_bytes)
 
 
-def write_block(file_obj, model, weights_dtype, dtype_size, block_idx):
-    segment_name = f"block_{block_idx}".encode()
-    segment_name_size = len(segment_name)
-    file_obj.write(itob(segment_name_size))
-    file_obj.write(segment_name)
+def write_block(fout, name, model, weights_size, activ_size, block_idx):
+    name = name.encode()
+    # <block_name_size, block_name>
+    fout.write(itob(len(name)))
+    fout.write(name)
 
     h = model.h[block_idx]
     attn_qw, attn_kw, attn_vw = h.attn.c_attn.weight.split(model.config.n_state, dim=0)
     attn_qb, attn_kb, attn_vb = h.attn.c_attn.bias.split(model.config.n_state, dim=0)
+
+    layer_name = f"{name.decode()}.attn.q"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=attn_qw, bias=attn_qb)
+
+    layer_name = f"{name.decode()}.attn.k"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=attn_kw, bias=attn_kb)
+
+    layer_name = f"{name.decode()}.attn.v"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=attn_vw, bias=attn_vb)
+
     attn_pw = h.attn.c_proj.weight
     attn_pb = h.attn.c_proj.bias
+    layer_name = f"{name.decode()}.attn.c_proj"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=attn_pw, bias=attn_pb)
+
     ln_1w = h.ln_1.weight
     ln_1b = h.ln_1.bias
+    layer_name = f"{name.decode()}.ln_1"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=ln_1w, bias=ln_1b)
+
     mlp_fcw = h.mlp.c_fc.weight
     mlp_fcb = h.mlp.c_fc.bias
+    layer_name = f"{name.decode()}.mlp.c_fc"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=mlp_fcw, bias=mlp_fcb)
+
     mlp_pw = h.mlp.c_proj.weight
     mlp_pb = h.mlp.c_proj.bias
+    layer_name = f"{name.decode()}.mlp.c_proj"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=mlp_pw, bias=mlp_pb)
+
     ln_2w = h.ln_2.weight
     ln_2b = h.ln_2.bias
-    block_tensors = [attn_qw, attn_qb, attn_kw, attn_kb, attn_vw, attn_vb, attn_pw, attn_pb,
-                   ln_1w, ln_1b, mlp_fcw, mlp_fcb, mlp_pw, mlp_pb, ln_2w, ln_2b]
-    block_tensors = [t.flatten() for t in block_tensors]
-    combined_tensors = torch.cat(block_tensors, dim=0)
-    expected_size = (12 * model.config.n_state * model.config.n_state + 13 * model.config.n_state) * dtype_size
-    tensor_to_file(combined_tensors, file_obj, dtype_size, expected_size)
+    layer_name = f"{name.decode()}.ln_2"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=weights_size, w0=ln_2w, bias=ln_2b)
 
-def convert_model_to_gten(model, model_name, vocab_fname, weights_dtype):
-    DTYPE_SIZE = 2 if weights_dtype == torch.float16 else 4
+    layer_name = f"{name.decode()}.attn.qkv_out"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=None, w0=None, bias=None)
 
-    model_fname = f"{model_name}.fp16.gten" if weights_dtype == torch.float16 else f"{model_name}.fp32.gten"
-    print("Converting ...")
-    with open(model_fname, "wb") as f:
-        f.write(itob(GTEN_MAGIC_NUMBER))
-        f.write(itob(DTYPE_SIZE))
-        f.write(itob(model.config.n_vocab))
-        f.write(itob(model.config.n_ctx))
-        f.write(itob(model.config.n_state))
-        f.write(itob(model.config.n_layer))
-        f.write(itob(model.config.n_head))
+    layer_name = f"{name.decode()}.mlp.gelu"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=None, w0=None, bias=None)
+
+    layer_name = f"{name.decode()}.inp_res"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=None, w0=None, bias=None)
+
+    layer_name = f"{name.decode()}.attn_res"
+    write_layer(
+        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+        weights_size=None, w0=None, bias=None)
+
+def convert_model_to_gten(model, model_name, vocab_fname, weights_size):
+    if weights_size == 1:
+        model_fname = f"{model_name}.q8.gten"
+        activ_size = 4
+    elif weights_size == 2:
+        model_fname = f"{model_name}.fp16.gten"
+        activ_size = 2
+    else:
+        model_fname = f"{model_name}.fp32.gten"
+        activ_size = 4
+
+
+    with open(model_fname, "wb") as fout:
+        fout.write(itob(GTEN_MAGIC_NUMBER, width=8))
+        fout.write(itob(model.config.n_vocab))
+        fout.write(itob(model.config.n_ctx))
+        fout.write(itob(model.config.n_state))
+        fout.write(itob(model.config.n_layer))
+        fout.write(itob(model.config.n_head))
         
         print("Writing vocab")
         segment_name = b"vocab"
@@ -212,42 +306,34 @@ def convert_model_to_gten(model, model_name, vocab_fname, weights_dtype):
             vocab_bytes = vf.read()
             segment_size = len(vocab_bytes)
             assert segment_size == expected_size, f"Vocab: expected={expected_size}, real={segment_size}"
-            f.write(itob(segment_name_size))
-            f.write(segment_name)
-            f.write(itob(segment_size))
-            f.write(vocab_bytes)
+            fout.write(itob(segment_name_size))
+            fout.write(segment_name)
+            fout.write(itob(segment_size))
+            fout.write(vocab_bytes)
         
-        print("Writing wte")
-        segment_name = b"wte"
-        segment_name_size = len(segment_name)
-        f.write(itob(segment_name_size))
-        f.write(segment_name)
-        expected_size = model.config.n_vocab * model.config.n_state * DTYPE_SIZE
-        tensor_to_file(model.wte.weight, f, DTYPE_SIZE, expected_size)
+        print("Converting wte")
+        write_layer(
+            fout, "wte", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+            weights_size=weights_size, w0=model.wte.weight, bias=None)
         
-        print("Writing wpe")
-        segment_name = b"wpe"
-        segment_name_size = len(segment_name)
-        f.write(itob(segment_name_size))
-        f.write(segment_name)
-        expected_size = model.config.n_ctx * model.config.n_state * DTYPE_SIZE
-        tensor_to_file(model.wpe.weight, f, DTYPE_SIZE, expected_size)
-        
-        for i in range(model.config.n_layer):
-            print(f"Writing block_{i}")
-            write_block(f, model, weights_dtype, DTYPE_SIZE, i)
-        
-        print("Writing ln_f")
-        segment_name = b"ln_f"
-        segment_name_size = len(segment_name)
-        f.write(itob(segment_name_size))
-        f.write(segment_name)
-        expected_size = model.config.n_state * 2 * DTYPE_SIZE
-        combined_data = torch.cat((model.ln_f.weight.flatten(), model.ln_f.bias.flatten()), dim=0)
-        tensor_to_file(combined_data, f, DTYPE_SIZE, expected_size)
+        print("Converting wpe")
+        write_layer(
+            fout, "wpe", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+            weights_size=weights_size, w0=model.wpe.weight, bias=None)
 
-    # A little sanity check.
-    test_converted(model_fname, model, DTYPE_SIZE)
+        write_layer(
+            fout, "emb_res", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+            weights_size=None, w0=None, bias=None)
+            
+        for i in range(model.config.n_layer):
+            print(f"Converting block_{i}")
+            write_block(fout, f"h.{i}", model, weights_size, activ_size, i)
+        
+        print("Converting ln_f")
+        write_layer(
+            fout, "ln_f", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
+            weights_size=weights_size, w0=model.ln_f.weight, bias=model.ln_f.bias)
+
 
 
 # Upload vocab fname[down].
@@ -302,24 +388,55 @@ MODEL_CONFIG = {
 
 
 def download_and_convert(model_name, dtype, model_path, vocab_path):
-    weights_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    print(F"Converting to dtype: {dtype}[{weights_dtype}]")
+    if dtype == "qwi8":
+        weights_size = 1
+    elif dtype == "fp16":
+        weights_size = 2
+    elif dtype == "fp32":
+        weights_size = 4
+    else:
+        assert False
+
+    print(F"Converting to dtype: {dtype}")
 
     if not model_path:
         model_path = download_model(model_name, MODEL_URL[model_name])
     if not vocab_path:
         vocab_path = download_vocab(VOCAB_URL)
     model = Transformer.from_pretrained(model_path, MODEL_CONFIG[model_name])
-    convert_model_to_gten(model, model_name, vocab_path, weights_dtype)
+    convert_model_to_gten(model, model_name, vocab_path, weights_size)
     print("Conversion complete!!!")
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model", help="Model name to be converted.", choices=MODEL_CONFIG.keys())
-parser.add_argument("dtype", help="Weights dtype.", choices=("fp32", "fp16"))
-parser.add_argument("--mpath", help="Optional path to source model to avoid download.")
-parser.add_argument("--vpath", help="Optional path to vocab to avoid download.")
+parser.add_argument("dtype", help="Weights dtype.", choices=("fp32", "fp16", "qwi8"))
+parser.add_argument("--mpath", help="Optional path to source model if you have it locally.")
+parser.add_argument("--vpath", help="Optional path to vocab if you have it locally.")
 
 args = parser.parse_args()
 
 download_and_convert(args.model, args.dtype, args.mpath, args.vpath)
+
+        
+"""
+
+OPTIONS:
+~ gpt_to_gten.py MODEL DTYPE OPTIONS
+
+MODEL: {Gpt2, Gpt2-medium, Gpt2-large, Gpt2-xl}
+DTYPE: {f32, f16, qwi8}
+OPTIONS:
+    
+------------------
+ Activ   | Weight
+ --------|--------
+[Float32, Float32]  ~fpcvt
+[Float16, Float16]  ~fpcvt
+[  Qint8,   Qint8]  --full-quantization 
+[Float32,   Qint8]  --weight-only-quantization
+[Qint8,   Float32]  --activation-only-quantization
+
+~ qcvt<overload_t>(inp):      FP32 <-> FP16 conv: template
+~ dequantize(overload_t inp): overload for {FP32, Qint}
+"""
