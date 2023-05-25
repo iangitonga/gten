@@ -41,7 +41,7 @@ def download_model(model_name):
         return
     os.makedirs("models", exist_ok=True)
     model_url_key = f"{model_name}.fp16"
-    _download_model(MODELS_URLS[model_url_key], model_path)
+    _download_model(MODELS_URLS[model_name], model_path)
 
 
 if len(sys.argv) < 2 or sys.argv[1] not in MODELS:
