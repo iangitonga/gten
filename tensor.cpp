@@ -4,214 +4,83 @@
 #include <cstring>
 #include <iostream>
 #include <iomanip>
-#include <stdlib.h>
 
-
-void* alloc_mem(size_t nbytes) noexcept
-{
-    void* ptr = std::malloc(nbytes);
-    GTEN_ASSERT(ptr, "Memory error: failed to allocate %ld bytes.", nbytes);
-    return ptr;
-}
-
-void free_mem(void* ptr) noexcept {
-    std::free(ptr);
-}
 
 
 namespace gten {
 
-uint64_t Tensor::total_memory_allocated = 0;
-
-Tensor::Tensor(const std::vector<int32_t>& shape, Dtype dtype, Float32 scale, int zerop)
-    : dtype_{dtype}, scale_{scale}, zero_point_{zerop}
+Tensor::Tensor(TensorMemoryPool& pool, std::initializer_list<int> shape, Dtype dtype)
 {
-    refcount_ = reinterpret_cast<int32_t*>(alloc_mem(4));
-    *refcount_ = 1;
-
-    validate_shape(shape);
-    shape_ = shape;
-    set_strides(shape);
+    set_shape(shape);
+    dtype_ = dtype;
+    ndims_ = shape.size();
     numel_ = numel_from_shape();
-    storage_size_ = nbytes();
-
-    data_ = alloc_mem(nbytes());
-
-    Tensor::total_memory_allocated += nbytes();
+    storage_capacity_ = nbytes();
+    data_ = pool.request_mem(storage_capacity_);
 }
 
-Tensor::Tensor(const void *src_data, const std::vector<int32_t>& shape, Dtype dtype)
-    : dtype_{dtype}
+Tensor::Tensor(void* data_ptr, std::initializer_list<int> shape, Dtype dtype)
 {
-    refcount_ = reinterpret_cast<int32_t*>(alloc_mem(4));
-    *refcount_ = 1;
-
-    validate_shape(shape);
-    shape_ = shape;
-    set_strides(shape);
+    GTEN_ASSERT(data_ptr != nullptr, "Expected a non-null pointer but got a nullptr.");
+    data_ = data_ptr;
+    set_shape(shape);
+    dtype_ = dtype;
+    ndims_ = shape.size();
     numel_ = numel_from_shape();
-    storage_size_ = nbytes();
-
-    data_ = alloc_mem(nbytes());
-    std::memcpy(data_, src_data, nbytes());
+    storage_capacity_ = nbytes();
 }
 
-Tensor::Tensor(const Tensor& rhs) noexcept
-{
-    if (this != &rhs) {
-        // We are constructing a new tensor with data copied from an existing tensor.
-        // So we just copy the data and refcount and incref it.
-        shape_ = rhs.shape_;
-        strides_ = rhs.strides_;
-        dtype_ = rhs.dtype_;
-        numel_ = rhs.numel_;
-        scale_ = rhs.scale_;
-        zero_point_ = rhs.zero_point_;
-        storage_size_ = rhs.storage_size_;
-        data_ = rhs.data_;
-        refcount_ = rhs.refcount_;
-        incref();
+ void Tensor::set_shape(std::initializer_list<int> shape) {
+    const size_t ndims = shape.size();
+    GTEN_ASSERT(
+        ndims > 1 || ndims < 3,
+        "Expected tensor shape to have ndims=(1, 2 or 3) but got ndims=%ld instead.",
+        ndims);
+
+    for (int i = 0; i < ndims; i++)
+    {
+        int size_i = *(shape.begin() + i);
+        shape_[i] = size_i;
+        GTEN_ASSERT(size_i != 0, "The size of dim %d of the given shape is zero.", i);
     }
-}
+ }
 
-Tensor& Tensor::operator=(const Tensor& rhs) noexcept
-{
-    if (this != &rhs) {
-        // We are copying data from an existing tensor to an existing tensor(this).
-        // So we decref on the data we are holding, release it, replace it by copy
-        // and incref the copied.
-        shape_ = rhs.shape_;
-        strides_ = rhs.strides_;
-        dtype_ = rhs.dtype_;
-        numel_ = rhs.numel_;
-        scale_ = rhs.scale_;
-        zero_point_ = rhs.zero_point_;
-        storage_size_ = rhs.storage_size_;
-        decref(); // Decref the current refcount.
-        data_ = rhs.data_;  // Copy data.
-        refcount_ = rhs.refcount_; // Replace by copied decref.
-        incref(); // Incref the copied refcount.
-    }
-    return *this;
-}
-
-Tensor::Tensor(Tensor&& rhs) noexcept
-{
-    if (this != &rhs) {
-        // 'Steal' data from the other tensor. We must leave the other tensor in an invalid
-        // state to prevent it to incref/decref the tensor data.
-        shape_ = std::move(rhs.shape_);
-        strides_ = std::move(rhs.strides_);
-        dtype_ = rhs.dtype_;
-        numel_ = rhs.numel_;
-        scale_ = rhs.scale_;
-        zero_point_ = rhs.zero_point_;
-        storage_size_ = rhs.storage_size_;
-        data_ = rhs.data_;
-        refcount_ = rhs.refcount_;
-
-        rhs.data_ = nullptr;
-        rhs.refcount_ = nullptr;
-    }
-}
-
-Tensor& Tensor::operator=(Tensor&& rhs) noexcept
-{
-    if (this != &rhs) {
-        // 'Steal' data from the other tensor. We must leave the other tensor in an invalid
-        // state to prevent it to incref/decref the tensor data.
-        shape_ = std::move(rhs.shape_);
-        strides_ = std::move(rhs.strides_);
-        dtype_ = rhs.dtype_;
-        numel_ = rhs.numel_;
-        scale_ = rhs.scale_;
-        zero_point_ = rhs.zero_point_;
-        storage_size_ = rhs.storage_size_;
-        data_ = rhs.data_;
-        refcount_ = rhs.refcount_;
-
-        rhs.data_ = nullptr;
-        rhs.refcount_ = nullptr;
-    }
-    return *this;
-}
-
-Tensor::~Tensor()
-{
-    decref();
-}
-
-void Tensor::incref()
-{
-    if (refcount_)
-        *refcount_ = *refcount_ + 1;
-}
-
-void Tensor::decref()
-{
-    if (refcount_) {
-        *refcount_ = *refcount_ - 1;
-        if (*refcount_ == 0) {
-            free_mem(data_);
-            free_mem(refcount_);
-            refcount_ = nullptr;
-        }
-    }
-}
-
-void Tensor::resize(const std::vector<int32_t>& shape) noexcept {
-    validate_shape(shape);
-    shape_ = shape;
-    set_strides(shape_);
+void Tensor::resize(std::initializer_list<int> shape) noexcept {
+    set_shape(shape);
+    ndims_ = shape.size();
     numel_ = numel_from_shape();
     GTEN_ASSERT(
-        nbytes() <= storage_size_,
+        nbytes() <= storage_capacity_,
         "Resize size: %ld, exceeds preallocated size: %ld.",
         nbytes(),
-        storage_size_);
-}
-
-void Tensor::resize(std::vector<int32_t> &&shape) noexcept
-{
-    validate_shape(shape);
-    shape_ = std::move(shape);
-    set_strides(shape_);
-    numel_ = numel_from_shape();
-    if (!(nbytes() <= storage_size_))
-        std::cout << "err\n";
-    GTEN_ASSERT(
-        nbytes() <= storage_size_,
-        "Resize size: %ld, exceeds preallocated size: %ld.",
-        nbytes(),
-        storage_size_);
-}
-
-void Tensor::set_strides(const std::vector<int32_t> &shape)
-{
-    uint32_t n_dims = shape.size();
-    if (n_dims == 1)
-        strides_ = std::vector<int32_t>({1});
-    else if (n_dims == 2)
-        strides_ = std::vector<int32_t>({shape[1], 1});
-    else if (n_dims == 3)
-        strides_ = std::vector<int32_t>({shape[2] * shape[1], shape[1], 1});
+        storage_capacity_);
 }
 
 int32_t Tensor::numel_from_shape() const noexcept {
     int32_t numel = 1;
-    for (int32_t size : shape_)
-        numel *= size;
+    for (int i = 0; i < ndims_; i++)
+       numel *= shape_[i];
     return numel;
 }
 
 int32_t Tensor::size(int32_t i) const
 {
     GTEN_ASSERT(
-        i < ndims(),
+        i < ndims_,
         "Tensor dim access, %d, is out of range of a tensor with %d-dims.",
         i,
-        ndims());
+        ndims_);
     return shape_[i];
+}
+
+bool Tensor::shape_is_equal(std::initializer_list<int> shape) const noexcept
+{
+    if (shape.size() != ndims_)
+        return false;
+    for (int i = 0; i < ndims_; i++)
+        if (shape_[i] != *(shape.begin() + 1))
+            return false;
+    return true;
 }
 
 void Tensor::print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) const noexcept
@@ -227,10 +96,8 @@ void Tensor::print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) con
                   << std::setprecision(4)
                   << std::setw(7)
                   << reinterpret_cast<Float32*>(data_)[item_idx];
-    else if (dtype_ ==kInt32)
-        std::cout << reinterpret_cast<Int32*>(data_)[item_idx];
     else
-        std::cout << (int)(reinterpret_cast<Qint8*>(data_)[item_idx]);
+        std::cout << reinterpret_cast<Int32*>(data_)[item_idx];
     if (col_idx != n_cols - 1)
         std::cout << ", ";
     if (col_idx > 0 && (col_idx % max_cols) == 0)
@@ -245,18 +112,15 @@ void Tensor::print() const noexcept
         std::cout << "Numel=" << numel_ << "\nDtype=Float16\n[";
     else if (dtype_ == kFloat32)
         std::cout << "Numel=" << numel_ << "\nDtype=Float32\n[";
-    else if (dtype_ == kInt32)
-        std::cout << "Numel=" << numel_ << "\nDtype=Int32\n[";
     else
-        std::cout << "Numel=" << numel_ << "\nDtype=Qint8\n[";
+        std::cout << "Numel=" << numel_ << "\nDtype=Int32\n[";
 
-    const uint32_t n_dims = shape_.size();
-    if (n_dims == 1)
+    if (ndims_ == 1)
     {
-        for (int col = 0; col < numel_; col += strides_[0])
-            print_single(col * strides_[0], col, numel_);
+        for (int col = 0; col < numel_; col += 1)
+            print_single(col, col, numel_);
     }
-    else if (n_dims == 2)
+    else if (ndims_ == 2)
     {
         const uint32_t n_rows = shape_[0];
         const uint32_t n_cols = shape_[1];
@@ -266,7 +130,7 @@ void Tensor::print() const noexcept
             else std::cout << " [";
             for (int col = 0; col < n_cols; col++)
             {
-                const int idx = row * strides_[0] + col * strides_[1];
+                const int idx = row * shape_[1] + col;
                 if (idx >= numel_)
                     break;
                 print_single(idx, col, n_cols);
@@ -290,7 +154,7 @@ void Tensor::print() const noexcept
                 else std::cout << "  [";
                 for (int col = 0; col < n_cols; col++)
                 {
-                    const int idx = (depth * strides_[0]) + (row * strides_[1]) + col* strides_[2];
+                    const int idx = (depth * shape_[1] * shape_[2]) + (row * shape_[1]) + col;
                     if (idx >= numel_)
                         break;
                     print_single(idx, col, n_cols);
@@ -306,17 +170,6 @@ void Tensor::print() const noexcept
         
     }
     std::cout << "])\n";
-}
-
-void Tensor::validate_shape(const std::vector<int32_t> &shape) const
-{
-    if (shape.size() == 0)
-        GTEN_ASSERT(false, "Creation of tensor with no shape is not allowed");
-    if (shape.size() > 3)
-        GTEN_ASSERT(false, "Creation of tensors with dims > 4 is not supported.");
-    for (uint32_t size : shape_)
-        if (size == 0)
-            GTEN_ASSERT(false, "One of the provided dimensions in the shape is zero.");
 }
 
 std::ostream& operator<<(std::ostream& stream, const Tensor& tensor) {

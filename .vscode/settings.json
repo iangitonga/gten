@@ -37,6 +37,7 @@
         "utility": "cpp",
         "cerrno": "cpp",
         "iterator": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "bitset": "cpp"
     }
 }

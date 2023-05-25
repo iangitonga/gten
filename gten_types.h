@@ -10,23 +10,19 @@ namespace gten
 typedef int32_t Int32;
 typedef uint16_t Float16;
 typedef float Float32;
-typedef int8_t Qint8;
 
 // Allows data type information to be stored and passed around as variables because we
 // cannot do that with the types themselves.
-enum class Dtype { Int32, Float16, Float32, Qint8 };
+enum class Dtype { Int32, Float16, Float32 };
 
 // Convenient shorthands for the enum class above.
 static Dtype kInt32 = Dtype::Int32;
 static Dtype kFloat16 = Dtype::Float16;
 static Dtype kFloat32 = Dtype::Float32;
-static Dtype kQint8 = Dtype::Qint8;
 
 // Convert Dtype to a str for error reporting.
 static const char* dtype_str(Dtype dtype) {
-    if (dtype == Dtype::Qint8)
-        return "Qint8";
-    else if (dtype == Dtype::Int32)
+    if (dtype == Dtype::Int32)
         return "Int32";
     else if (dtype == Dtype::Float16)
         return "Float16";

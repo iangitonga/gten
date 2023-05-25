@@ -12,36 +12,60 @@
 namespace gten
 {
 
+class TensorMemoryPool {
+public:
+    TensorMemoryPool(int64_t memsize) {
+        memptr_ = reinterpret_cast<uint8_t*>(std::malloc(memsize));
+        GTEN_ASSERT(memptr_, "Failed to allocate %ld bytes of memory.", memsize);
+        mem_capacity_ = memsize;
+        std::printf("Allocated %ldMB of memory.\n", memsize / 1000000);
+    }
+
+    void* request_mem(int64_t size) {
+        GTEN_ASSERT(
+            size <= mem_capacity_ - allocated_mem_,
+            "Memory pool failed to allocate %ld bytes of memory. cap=%ld, alloc=%ld, Rem=%ld.",
+            size, mem_capacity_, allocated_mem_, mem_capacity_ - allocated_mem_);
+        void* mem = reinterpret_cast<void*>(memptr_ + allocated_mem_);
+        allocated_mem_ += size;
+        return mem;
+    }
+
+private:
+    int64_t mem_capacity_;
+    int64_t allocated_mem_{0}; 
+    uint8_t* memptr_;
+};
+
+
 class Tensor
 {
 public:
     Tensor() = default;
-    // Construct a tensor of the given shape and dtype with storage allocated but not
-    // initialised.
-    Tensor(const std::vector<int32_t>& shape, Dtype dtype, Float32 scale = 0.0f, int zerop = 0);
 
-    // Construct a tensor from the given data source with the given shape and dtype.
-    // The data is copied from source and thus the tensor does not assume ownership of
-    // the data.
-    Tensor(const void* data, const std::vector<int32_t>& shape, Dtype dtype);
+    // Construct a tensor with data the given shape and dtype. Memory pool acts as the
+    // allocator for the tensor storage.
+    Tensor(TensorMemoryPool& pool, std::initializer_list<int> shape, Dtype dtype);
+
+    // Construct a tensor from an external data source. The constructed tensor does not take
+    // ownership of the memory referenced by the pointer.
+    Tensor(void* data_ptr, std::initializer_list<int> shape, Dtype dtype);
 
     // Copy-construct tensor from source tensor. Data from source tensor is shared with
-    // the new tensor and thus data is not copied from source.
-    Tensor(const Tensor& rhs) noexcept;
+    // the new tensor and thus data itself is not copied from source.
+    Tensor(const Tensor& rhs) = default;
 
-    // Move-construct a tensor from source tensor. The source tensor is left in an invalid
-    // state after the move operation.
-    Tensor(Tensor&& rhs) noexcept;
+    // Move-construct a tensor from source tensor.
+    Tensor(Tensor&& rhs) = default;
 
     // Copy-assign tensor from source tensor. Data from source tensor is shared with the
-    // new tensor and thus data is not copied from source.
-    Tensor &operator=(const Tensor& rhs) noexcept;
+    // new tensor and thus data itself is not copied from source.
+    Tensor &operator=(const Tensor& rhs) = default;
 
-    // Move-assign a tensor from source tensor. The source tensor is left in an invalid
-    // state after the move operation.
-    Tensor &operator=(Tensor&& rhs) noexcept;
+    // Move-assign a tensor from source tensor.
+    Tensor &operator=(Tensor&& rhs) = default;
 
-    ~Tensor();
+    ~Tensor() = default;
     
     // Get the pointer to internal data buffer.
     template <typename T>
@@ -60,21 +84,19 @@ public:
 
     // Get the number of bytes that an element in the tensor occupies.
     size_t itemsize() const noexcept {
-        if (dtype_ == kQint8)
-            return 1;
         return (dtype_ == kFloat16) ? 2 : 4;
     }
 
     bool is_1d() const noexcept {
-        return shape_.size() == 1;
+        return ndims_ == 1;
     }
 
     bool is_2d() const noexcept {
-        return shape_.size() == 2;
+        return ndims_ == 2;
     }
 
     int32_t ndims() const noexcept {
-        return shape_.size();
+        return ndims_;
     }
 
     // Get the number of elems in the tensor.
@@ -87,8 +109,7 @@ public:
     // reallocate tensor storage.
     // Note: this is not a reshape function because a reshape function can only reshape
     // a tensor if the new and the existing shapes have the same number of elements.
-    void resize(const std::vector<int32_t>& shape) noexcept;
-    void resize(std::vector<int32_t>&& shape) noexcept;
+    void resize(std::initializer_list<int> shape) noexcept;
 
     friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor);
     void print() const noexcept;
@@ -96,94 +117,26 @@ public:
     /// Returns the size of the give dimension.
     int32_t size(int32_t i) const;
 
-    const std::vector<int32_t>& shape() const noexcept {
-        return shape_;
-    }
+    bool shape_is_equal(std::initializer_list<int> shape) const noexcept;
 
     size_t nbytes() const noexcept {
         return numel_ * itemsize();
     }
 
-    bool is_quantized() {
-        return dtype_ == kQint8;
-    }
-
-    float scale() const noexcept {
-        return scale_;
-    }
-
-    int zero_point() const noexcept {
-        return zero_point_;
-    }
-
-    // Quantize from the given type to Qint8.
-    template<typename scalar_t>
-    Float32 deq(scalar_t x) {
-        // Use of `if constexpr` instead of explicit specialization to overload for
-        // different types because it is not allowed in this scope.
-        if constexpr(std::is_same<scalar_t, Float32>::value) {
-            return x;
-        }
-        else if constexpr(std::is_same<scalar_t, Qint8>::value) {
-            return scale_ * (Float32)((int)x - zero_point_);
-        }
-        else {
-            GTEN_ASSERT(false, "Dequantize only allowed from Float32 and Qint8 types.");
-        }
-    }
-
-    // Quantize from Float32 to the given type.
-    template<typename scalar_t>
-    scalar_t qu(Float32 x) {
-        if constexpr(std::is_same<scalar_t, Float32>::value) {
-            return x;
-        }
-        else if constexpr(std::is_same<scalar_t, Qint8>::value) {
-            return static_cast<Qint8>(std::roundf(x/scale_ + zero_point_));
-        }
-        else {
-            GTEN_ASSERT(false, "Quantize only allowed to Float32 and Qint8 types.");
-        }
-    }
-
-public:
-    static uint64_t total_memory_allocated;
-
 private:
-    std::vector<int32_t> shape_;
-    std::vector<int32_t> strides_;
-    Dtype dtype_;
-    int32_t numel_{0};
-
-    // Allocated storage size, in bytes, when the tensor is initialised.
-    size_t storage_size_{0};
-
     // Pointer to tensor data storage.
-    void* data_;
+    void* data_{nullptr};
+    // Capacity of the data pointer allocated storage.
+    size_t storage_capacity_{0};
+    // Number of elements in the tensor.
+    int32_t numel_{0};
+    // Number of tensor dimensions.
+    int32_t ndims_{0};
+    int32_t shape_[3]{0, 0, 0};
+    Dtype dtype_{Dtype::Float32};
 
-    // We use a simple reference counting technique to allow many tensors to share the
-    // same data. When tensors are copied, we do not allocate new memory for the new copy
-    // and copy the data. Instead, we simply copy the data pointer along with the
-    // heap-allocated refcount pointer so that the two tensors share the same data. When
-    // data is copied we increase the refcount and decrease it when a tensor pointing to
-    // the same data is destroyed. If the refcount gets to zero, we deallocate the data.
-    // Note: Using `std::shared_ptr` could probably have been more appropriate here.
-    int32_t* refcount_{nullptr};
-
-    // Params for quantized tensors, i.e tensors with dtype=Qint8, to allow quantization
-    // and dequantization.
-    Float32 scale_{0.0f}; 
-    int32_t zero_point_{0}; 
-
-    // Increase refcount by one.
-    void incref();
-
-    // Decrease refcount by one. If refcount hits zero, the data is deallocated.
-    void decref();
-
-    void set_strides(const std::vector<int32_t>& shape);
     int32_t numel_from_shape() const noexcept;
-    void validate_shape(const std::vector<int32_t>& shape) const;
+    void set_shape(std::initializer_list<int> shape);
     void print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) const noexcept;
 };
 

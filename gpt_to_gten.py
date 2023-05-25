@@ -125,52 +125,22 @@ def btoi(bytes_):
     return int.from_bytes(bytes_, BYTEORDER)
 
 
-class Qparams:
-    def __init__(self, scale: float, zero_point: int):
-        self.s_bytes = np.array([scale], dtype=np.float32).tobytes()
-        self.z_bytes = np.array([zero_point], dtype=np.int32).tobytes()
 
-DEFAULT_QPARAMS = Qparams(0.0, 0)
-
-def quantize_weight(weight):
-    aq, bq = -128, 127
-    a, b = weight.min(), weight.max()
-    scale = (b-a)/(bq-aq)
-    zero_point = int((b*aq - a*bq)/(b-a))
-    qtensor = np.round(weight * 1/scale) + zero_point
-    qtensor = np.clip(qtensor, a_min=aq, a_max=bq).astype(np.int8)
-    qparams = Qparams(scale, zero_point)
-    return qtensor, qparams
-
-
-def write_layer(fout, name, activ_size, activ_qparams, weights_size, w0, bias):
+def write_layer(fout, name, weights_size, w0, bias):
     name = name.encode()
     # <layer_name_size, layer_name>
     fout.write(itob(len(name)))
     fout.write(name)
-
-    # Activations
-    # <act_name_size, act_qs, act_qz>
-    fout.write(itob(activ_size))
-    fout.write(activ_qparams.s_bytes)
-    fout.write(activ_qparams.z_bytes)
 
     # W0
     if w0 is not None:
         w0_name = f"{name.decode()}.weight".encode()
         fout.write(itob(len(w0_name)))
         fout.write(w0_name)
-        fout.write(itob(weights_size))
+
         w0 = w0.detach().numpy().flatten()
-        w0_qparams = DEFAULT_QPARAMS
-        if weights_size == 1:
-            w0, w0_qparams = quantize_weight(w0)
-        elif weights_size == 2:
-            w0 = w0.astype(np.float16)
-        else:
-            w0 = w0.astype(np.float32)
-        fout.write(w0_qparams.s_bytes)
-        fout.write(w0_qparams.z_bytes)
+        w0 = w0.astype(np.float16)
+
         w0_bytes = w0.tobytes()
         fout.write(itob(len(w0_bytes)))
         fout.write(w0_bytes)
@@ -181,24 +151,16 @@ def write_layer(fout, name, activ_size, activ_qparams, weights_size, w0, bias):
         bias_name = f"{name.decode()}.bias".encode()
         fout.write(itob(len(bias_name)))
         fout.write(bias_name)
-        bias_size = 2 if weights_size == 2 else 4
-        fout.write(itob(bias_size))
 
         bias = bias.detach().numpy().flatten()
-        bias_qparams = DEFAULT_QPARAMS
-        if weights_size == 2:
-            bias = bias.astype(np.float16)
-        else:
-            bias = bias.astype(np.float32)
+        bias = bias.astype(np.float16)
 
-        fout.write(bias_qparams.s_bytes)
-        fout.write(bias_qparams.z_bytes)
         bias_bytes = bias.tobytes()
         fout.write(itob(len(bias_bytes)))
         fout.write(bias_bytes)
 
 
-def write_block(fout, name, model, weights_size, activ_size, block_idx):
+def write_block(fout, name, model, weights_size, block_idx):
     name = name.encode()
     # <block_name_size, block_name>
     fout.write(itob(len(name)))
@@ -209,86 +171,42 @@ def write_block(fout, name, model, weights_size, activ_size, block_idx):
     attn_qb, attn_kb, attn_vb = h.attn.c_attn.bias.split(model.config.n_state, dim=0)
 
     layer_name = f"{name.decode()}.attn.q"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=attn_qw, bias=attn_qb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=attn_qw, bias=attn_qb)
 
     layer_name = f"{name.decode()}.attn.k"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=attn_kw, bias=attn_kb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=attn_kw, bias=attn_kb)
 
     layer_name = f"{name.decode()}.attn.v"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=attn_vw, bias=attn_vb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=attn_vw, bias=attn_vb)
 
     attn_pw = h.attn.c_proj.weight
     attn_pb = h.attn.c_proj.bias
     layer_name = f"{name.decode()}.attn.c_proj"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=attn_pw, bias=attn_pb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=attn_pw, bias=attn_pb)
 
     ln_1w = h.ln_1.weight
     ln_1b = h.ln_1.bias
     layer_name = f"{name.decode()}.ln_1"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=ln_1w, bias=ln_1b)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=ln_1w, bias=ln_1b)
 
     mlp_fcw = h.mlp.c_fc.weight
     mlp_fcb = h.mlp.c_fc.bias
     layer_name = f"{name.decode()}.mlp.c_fc"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=mlp_fcw, bias=mlp_fcb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=mlp_fcw, bias=mlp_fcb)
 
     mlp_pw = h.mlp.c_proj.weight
     mlp_pb = h.mlp.c_proj.bias
     layer_name = f"{name.decode()}.mlp.c_proj"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=mlp_pw, bias=mlp_pb)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=mlp_pw, bias=mlp_pb)
 
     ln_2w = h.ln_2.weight
     ln_2b = h.ln_2.bias
     layer_name = f"{name.decode()}.ln_2"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=weights_size, w0=ln_2w, bias=ln_2b)
-
-    layer_name = f"{name.decode()}.attn.qkv_out"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=None, w0=None, bias=None)
-
-    layer_name = f"{name.decode()}.mlp.gelu"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=None, w0=None, bias=None)
-
-    layer_name = f"{name.decode()}.inp_res"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=None, w0=None, bias=None)
-
-    layer_name = f"{name.decode()}.attn_res"
-    write_layer(
-        fout, layer_name, activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-        weights_size=None, w0=None, bias=None)
+    write_layer(fout, layer_name, weights_size=weights_size, w0=ln_2w, bias=ln_2b)
+    
 
 def convert_model_to_gten(model, model_name, vocab_fname, weights_size):
-    if weights_size == 1:
-        model_fname = f"{model_name}.q8.gten"
-        activ_size = 4
-    elif weights_size == 2:
-        model_fname = f"{model_name}.fp16.gten"
-        activ_size = 2
-    else:
-        model_fname = f"{model_name}.fp32.gten"
-        activ_size = 4
-
+    model_fname = f"{model_name}.fp16.gten"
 
     with open(model_fname, "wb") as fout:
         fout.write(itob(GTEN_MAGIC_NUMBER, width=8))
@@ -312,27 +230,17 @@ def convert_model_to_gten(model, model_name, vocab_fname, weights_size):
             fout.write(vocab_bytes)
         
         print("Converting wte")
-        write_layer(
-            fout, "wte", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-            weights_size=weights_size, w0=model.wte.weight, bias=None)
+        write_layer(fout, "wte", weights_size=weights_size, w0=model.wte.weight, bias=None)
         
         print("Converting wpe")
-        write_layer(
-            fout, "wpe", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-            weights_size=weights_size, w0=model.wpe.weight, bias=None)
-
-        write_layer(
-            fout, "emb_res", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-            weights_size=None, w0=None, bias=None)
+        write_layer(fout, "wpe", weights_size=weights_size, w0=model.wpe.weight, bias=None)
             
         for i in range(model.config.n_layer):
             print(f"Converting block_{i}")
-            write_block(fout, f"h.{i}", model, weights_size, activ_size, i)
+            write_block(fout, f"h.{i}", model, weights_size, i)
         
         print("Converting ln_f")
-        write_layer(
-            fout, "ln_f", activ_size=activ_size, activ_qparams=DEFAULT_QPARAMS,
-            weights_size=weights_size, w0=model.ln_f.weight, bias=model.ln_f.bias)
+        write_layer(fout, "ln_f", weights_size=weights_size, w0=model.ln_f.weight, bias=model.ln_f.bias)
 
 
 
@@ -387,17 +295,10 @@ MODEL_CONFIG = {
 }
 
 
-def download_and_convert(model_name, dtype, model_path, vocab_path):
-    if dtype == "qwi8":
-        weights_size = 1
-    elif dtype == "fp16":
-        weights_size = 2
-    elif dtype == "fp32":
-        weights_size = 4
-    else:
-        assert False
+def download_and_convert(model_name, model_path, vocab_path):
+    weights_size = 2
 
-    print(F"Converting to dtype: {dtype}")
+    print(F"Converting to FP16")
 
     if not model_path:
         model_path = download_model(model_name, MODEL_URL[model_name])
@@ -410,33 +311,9 @@ def download_and_convert(model_name, dtype, model_path, vocab_path):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model", help="Model name to be converted.", choices=MODEL_CONFIG.keys())
-parser.add_argument("dtype", help="Weights dtype.", choices=("fp32", "fp16", "qwi8"))
 parser.add_argument("--mpath", help="Optional path to source model if you have it locally.")
 parser.add_argument("--vpath", help="Optional path to vocab if you have it locally.")
 
 args = parser.parse_args()
 
-download_and_convert(args.model, args.dtype, args.mpath, args.vpath)
-
-        
-"""
-
-OPTIONS:
-~ gpt_to_gten.py MODEL DTYPE OPTIONS
-
-MODEL: {Gpt2, Gpt2-medium, Gpt2-large, Gpt2-xl}
-DTYPE: {f32, f16, qwi8}
-OPTIONS:
-    
-------------------
- Activ   | Weight
- --------|--------
-[Float32, Float32]  ~fpcvt
-[Float16, Float16]  ~fpcvt
-[  Qint8,   Qint8]  --full-quantization 
-[Float32,   Qint8]  --weight-only-quantization
-[Qint8,   Float32]  --activation-only-quantization
-
-~ qcvt<overload_t>(inp):      FP32 <-> FP16 conv: template
-~ dequantize(overload_t inp): overload for {FP32, Qint}
-"""
+download_and_convert(args.model, args.mpath, args.vpath)

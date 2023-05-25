@@ -80,7 +80,7 @@ struct Vec_f32x8 {
 
 static Float32* init_cache() {
     // This is a memory leak because we never delete the cache but its not a problem
-    // because we want the cache to last the entire lifetime of the program.
+    // because the cache lasts the entire lifetime of the program.
     Float32* cache = new Float32[65536];
     Float16 idx = 0;
     for (int i = 0; i < 65536; i++) {
