@@ -9,9 +9,13 @@
 #include "gpt2.h"
 
 
+using namespace gten;
+
 
 const char *usage = R"(
-usage: gpt2 [options] -p PROMPT
+usage:
+gpt2 [options] -p PROMPT  for a single prompt or
+gpt2 [options] for a chat interface. 
 
 Optional args.
 -sm :      Use small model (117M) for inference.
@@ -25,6 +29,7 @@ Examples:
   ./gpt2 -p "Once upon a time" 
   ./gpt2 -lg -p "Once upon a time"
   ./gpt2 -lg --temp 0.5 -p "Once upon a time"
+  ./gpt2
 )";
 
 
@@ -112,11 +117,6 @@ int main(int argc, char const *argv[])
         }
     }
 
-    if (options.prompt == "") {
-        std::cout << "Prompt is not provided.\n";
-		std::cout << usage << "\n";
-		return -1;
-    }
     options.print_debug_info();
 
     int res = std::system(options.get_dl_command().c_str());
@@ -125,20 +125,35 @@ int main(int argc, char const *argv[])
         return -1;
     }
 
-    GPT2 model{options, false};
+    GPT2* model = load_gpt(options, false);
 
-    if (options.greedy)
-        model.greedy_sample(options);
-    else
-        model.sample(options);
+    if (options.prompt == "") {
+        std::cout << "Chat interface. Write your prompt and press enter to submit. Enter q or press ctrl+c to quit.\n";
+        std::string prompt;
+        while (true) {
+            std::cout << "\n\n\x1B[0m[You]: ";
+            std::getline(std::cin, prompt);
+            if (prompt == "q")
+                break;
+
+            options.prompt = prompt;
+
+            if (options.greedy)
+                model->greedy_sample(options);
+            else
+                model->sample(options);
+
+            model->reset_acv_caches();
+        }
+    }
+    else {
+        if (options.greedy)
+            model->greedy_sample(options);
+        else
+            model->sample(options);
+    }
 
     return 0;
-}
-
-
-GPT2::GPT2(const InferenceOptions& inference_opts, bool show_load_info)
-{
-    load_from_file(inference_opts, show_load_info);
 }
 
 gten::Tensor GPT2::logits(const gten::Tensor &inp)
@@ -152,6 +167,15 @@ gten::Tensor GPT2::logits(const gten::Tensor &inp)
     return logits;
 }
 
+void GPT2::reset_acv_caches() {
+    res_.reset_acv_cache();
+    wte_.reset_acv_cache();
+    for (auto &block : blocks_)
+        block.reset_acv_cache();
+    ln_f_.reset_acv_cache();
+}
+
+
 // Used for debugging purposes.
 void GPT2::greedy_sample(const InferenceOptions& opts)
 {
@@ -159,7 +183,7 @@ void GPT2::greedy_sample(const InferenceOptions& opts)
 
     const int max_ctx_size = 128;
 
-    std::vector<int32_t> tokens = tokenizer.encode(opts.prompt);
+    std::vector<int32_t> tokens = tokenizer_.encode(opts.prompt);
     tokens.reserve(max_ctx_size);
     gten::Tensor logits;
     const int logits_size = 50257;
@@ -191,7 +215,7 @@ void GPT2::greedy_sample(const InferenceOptions& opts)
         int maxi = max_index;
         if (maxi == eot_token)
             break;
-        std::cerr << tokenizer.decode(maxi);
+        std::cerr << tokenizer_.decode(maxi);
         tokens.push_back(maxi);
 
         niter += 1;
@@ -205,27 +229,29 @@ void GPT2::sample(const InferenceOptions& opts)
 {
     time_sample_ms_ = 0;
 
-    const int max_ctx_size = 1024;
-
     std::random_device rd;
     std::mt19937 gen(rd());
 
-    std::vector<int32_t> tokens = tokenizer.encode(opts.prompt);
+    std::vector<int32_t> tokens = tokenizer_.encode(opts.prompt);
+    const int max_ctx_size = opts.calculate_max_ctx_size(tokens.size());
     tokens.reserve(max_ctx_size);
     const int logits_size = 50257;
     std::vector<std::pair<double, int>> logits_probs;
     logits_probs.reserve(logits_size);
     const int eot_token = 50256;
-    const int initial_pos = tokens.size() - 1;
+    const int initial_pos = tokens.size();
 
     // Total ntokens = Requested number of tokens + prompt num of tokens.
-    int total_ntokens = opts.gen_tokens + tokens.size();
+    // int total_ntokens = opts.gen_tokens + tokens.size();
+    int total_ntokens = opts.gen_tokens;
     // If the total_ntokens > max_prompt_size, generate up to
     // max_prompt_size. Else generate up to requested size.
-    const int max_iter = total_ntokens >= max_ctx_size ? max_ctx_size : total_ntokens;
+    const int max_iter = total_ntokens > 1000 ? 1000 : total_ntokens;
+    // std::cout << "Mi=" << max_iter << ", in=" << initial_pos << "\n";
 	int64_t niter = 0;
     // Use cerr because it is unbuffered.
-    std::cerr << "\n\n" << opts.prompt;
+    std::cerr << "\n[GPT]: \n\n";
+    std::cerr << opts.prompt << "\x1B[1;34m"; 
     for (int i = initial_pos; i < max_iter; i++)
     {
         // TODO: allow creation of tensors with external non-owning data.
@@ -272,15 +298,15 @@ void GPT2::sample(const InferenceOptions& opts)
         uint32_t maxi = dist(gen);
         if (maxi == eot_token)
             break;
-        std::cerr << tokenizer.decode(maxi);
+        std::cerr << tokenizer_.decode(maxi);
         tokens.push_back(maxi);
 
         niter += 1;
     }
     std::cerr << "\n";
 
-    if (opts.debug_mode)
-	   show_performance(niter);
+    // if (opts.debug_mode)
+	show_performance(niter);
 }
 
 
@@ -335,57 +361,6 @@ void GPT2::show_performance(int64_t niter) const
     std::cout << "--------------------------------------\n";
 }
 
-static int64_t calculate_mem_fp16(const GPT2Config& cfg, int max_ctx) {
-    int64_t weights_mem = (cfg.n_vocab * cfg.n_embed)
-      + (cfg.n_ctx * cfg.n_embed)
-      + cfg.n_layer * (12 * cfg.n_embed * cfg.n_embed + 13 * cfg.n_embed)
-      + (2 * cfg.n_embed);
-
-    int64_t acv_mem = cfg.n_vocab * 2
-      + (3 * max_ctx * cfg.n_embed)
-      + (cfg.n_layer * (10 * max_ctx * cfg.n_embed + cfg.n_head * max_ctx * max_ctx + 2 * max_ctx * 4 * cfg.n_embed));
-    
-    int64_t total_mem = 2 * (weights_mem + acv_mem);
-
-    return total_mem;
-}
-
-/** Gpt2 Model Binary format.
- * 
- * Key:
- *    <LABEL> = LABEL occupies 4 bytes in the binary.
- *    {LABEL: SIZE} = LABEL occupies SIZE bytes.
- * 
- * FORMAT:
- * {GTEN_magic_number: 8} = GTENFILE in ascii.
- * <n_vocab>
- * <max_ctx>
- * <n_embed>
- * <n_layer>
- * <n_head>
- * <size_vocab_idname>
- * {vocab_idname: size_vocab_idname}
- * <size_vocab>
- * {vocab: size_vocab}
- *
- * for layer in (wte, wpe, block_0, ... block_N, ln_f)
- *     [block_name_size]. Not included for wte, wpe and ln_f.
- *     [block_name]. Not included for wte, wpe and ln_f.
- *     <layer_name_size>
- *     <layer_name>
- *     <weight_name_size>
- *     <weight_name>
- *     <weight_nbytes>
- *     <weight_bytes>
- * 
- *     if layer.has_bias:
- *         <b_name_size>
- *         <b_name>
- *         <b_nbytes>
- *         <b_bytes>
- *
-*/
-
 static inline void read_block_header(std::ifstream& fin, bool debug = false)
 {
     std::string block_name;
@@ -410,7 +385,8 @@ static inline void read_layer_header(std::ifstream& fin, bool debug = false) {
 }
 
 static inline gten::Tensor read_weight(
-    std::ifstream& fin, gten::TensorMemoryPool& pool, std::initializer_list<int> shape, bool debug = false) {
+    std::ifstream& fin, std::initializer_list<int> shape, bool debug = false)
+{
     std::string weight_name;
     int32_t weight_name_size;
     fin.read(reinterpret_cast<char*>(&weight_name_size), sizeof(weight_name_size));
@@ -425,9 +401,9 @@ static inline gten::Tensor read_weight(
 
     gten::Dtype dtype = gten::kFloat16;
 
-    gten::Tensor tensor{pool, shape, dtype};
+    gten::Tensor tensor{shape, dtype};
     GTEN_ASSERT(
-        weight_payload_size == tensor.nbytes(),
+        static_cast<size_t>(weight_payload_size) == tensor.nbytes(),
         "Weight `%s` data size: %ld does not match the expected size: %d.",
         weight_name.c_str(), tensor.nbytes(), weight_payload_size);
     fin.read(tensor.data_ptr<char>(), weight_payload_size);
@@ -435,24 +411,60 @@ static inline gten::Tensor read_weight(
     return tensor;
 }
 
-void GPT2::load_from_file(const InferenceOptions& inference_opts, bool show_load_info)
+static inline void read_into_weight(
+    std::ifstream& fin, gten::Tensor& tensor, bool debug = false)
 {
-	using namespace gten;
+    std::string weight_name;
+    int32_t weight_name_size;
+    fin.read(reinterpret_cast<char*>(&weight_name_size), sizeof(weight_name_size));
+    weight_name.resize(weight_name_size);
+    fin.read(reinterpret_cast<char*>(weight_name.data()), weight_name_size);
 
+    int32_t weight_payload_size;
+    fin.read(reinterpret_cast<char*>(&weight_payload_size), sizeof(weight_payload_size));
+
+    // if (debug)
+        // std::cout << weight_name << " (" << weight_payload_size << ")\n";
+
+    GTEN_ASSERT(
+        static_cast<size_t>(weight_payload_size) == tensor.nbytes(),
+        "Weight `%s` data size: %ld does not match the expected size: %d.",
+        weight_name.c_str(), tensor.nbytes(), weight_payload_size);
+    fin.read(tensor.data_ptr<char>(), weight_payload_size);
+}
+
+GPT2::GPT2(const GPT2Config& config, int max_ctx, GPT2Tokenizer&& tokenizer)
+    : config_{config},
+      wte_{Embedding(config.n_vocab, config.n_embed, max_ctx)},
+      wpe_{PosEmbedding(config.n_ctx, config.n_embed)},
+      ln_f_{LayerNorm(max_ctx, config.n_embed)},
+      res_{Residual(max_ctx, config.n_embed)}
+{
+    tokenizer_ = std::move(tokenizer);
+    blocks_.reserve(config.n_layer);
+    for (int i = 0; i < config.n_layer; i++) {
+        blocks_.push_back(ResidualAttnBlock(config_.n_head, config_.n_embed, 4*config_.n_embed, max_ctx, /*mask_attn=*/true));
+    }
+}
+
+
+GPT2* load_gpt(const InferenceOptions &inference_opts, bool show_load_info)
+{
     std::ifstream fin(inference_opts.get_model_path(), std::ios::binary);
     GTEN_ASSERT(fin.is_open(), "Failed to open model file: %s\n", inference_opts.get_model_path().c_str());
     
-    gten::Timer timer(&time_load_ms_);
+    int64_t load_time_ms = 0;
+    gten::Timer timer(&load_time_ms);
 
     // Magic number.
     int64_t magic;
     fin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    GTEN_ASSERT(magic == magic_number_, "Magic number in the binary does not match the expected one.\n");
+    GTEN_ASSERT(magic == 0x454c49464e455447, "Magic number in the binary does not match the expected one.\n");
     
     // Model config.
-    config_ = GPT2Config();
-    fin.read(reinterpret_cast<char*>(&config_), sizeof(config_));
-    std::cout << config_;
+    GPT2Config config;
+    fin.read(reinterpret_cast<char*>(&config), sizeof(config));
+    std::cout << config;
 
     // Vocab
     std::string vocab_segment_name;
@@ -464,117 +476,76 @@ void GPT2::load_from_file(const InferenceOptions& inference_opts, bool show_load
     fin.read(reinterpret_cast<char*>(&vocab_segment_size), sizeof(vocab_segment_size));
     if (inference_opts.debug_mode)
         std::cout << "Read segment: [" << vocab_segment_name << "](" << vocab_segment_size << " bytes)\n";
-
+    
     // Tokenizer.
-    tokenizer = std::move(gten::GPT2Tokenizer(fin));
-
+    GPT2Tokenizer tokenizer{fin};
     const int num_prompt_tokens = tokenizer.encode(inference_opts.prompt).size();
     const int max_ctx = inference_opts.calculate_max_ctx_size(num_prompt_tokens);
-    int64_t req_mem = calculate_mem_fp16(config_, max_ctx);
-    TensorMemoryPool pool{req_mem};
+
+    GPT2* model = new GPT2{config, max_ctx, std::move(tokenizer)};
 
     // WTE
     read_layer_header(fin, inference_opts.debug_mode);
-    Tensor wte_weight = read_weight(fin, pool, {config_.n_vocab, config_.n_embed}, inference_opts.debug_mode);
-    const Tensor emb_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-    const Tensor emb_proj_acv{pool, {config_.n_vocab}, kFloat32};
-    wte_ = gten::Embedding{wte_weight, emb_acv, emb_proj_acv};
+    read_into_weight(fin, model->wte_.weight);
 
     // WPE
     read_layer_header(fin, inference_opts.debug_mode);
-    Tensor wpe_weight = read_weight(fin, pool, {config_.n_ctx, config_.n_embed}, inference_opts.debug_mode);
-    wpe_ = PosEmbedding{wpe_weight, config_.n_ctx};
+    read_into_weight(fin, model->wpe_.weight);
 
-    // (WTE + WPE) residual layer.
-    const Tensor res_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-    res_ = Residual{res_acv};
 
     // BLOCKS
-    blocks_ = std::vector<ResidualAttentionBlock>();
-    blocks_.reserve(config_.n_layer);
-    for (int64_t i = 0; i < config_.n_layer; i++)
+    for (auto& block : model->blocks_)
     {
         read_block_header(fin, inference_opts.debug_mode);
 
         // Query projection layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor qw = read_weight(fin, pool, {config_.n_embed, config_.n_embed}, inference_opts.debug_mode);
-        Tensor qb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor q_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Linear query{qw, qb, q_acv};
+        read_into_weight(fin, block.attn.query.weight);
+        read_into_weight(fin, block.attn.query.bias);
 
         // Key projection layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor kw = read_weight(fin, pool, {config_.n_embed, config_.n_embed}, inference_opts.debug_mode);
-        Tensor kb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor k_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Linear key{kw, kb, k_acv};
+        read_into_weight(fin, block.attn.key.weight);
+        read_into_weight(fin, block.attn.key.bias);
 
         // Value projection layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor vw = read_weight(fin, pool, {config_.n_embed, config_.n_embed}, inference_opts.debug_mode);
-        Tensor vb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor v_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Linear value{vw, vb, v_acv};
+        read_into_weight(fin, block.attn.value.weight);
+        read_into_weight(fin, block.attn.value.bias);
 
         // QKV_out projection layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor attn_projw = read_weight(fin, pool, {config_.n_embed, config_.n_embed}, inference_opts.debug_mode);
-        Tensor attn_projb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor out_proj_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Linear out_proj{attn_projw, attn_projb, out_proj_acv};
+        read_into_weight(fin, block.attn.qkv_proj.weight);
+        read_into_weight(fin, block.attn.qkv_proj.bias);
 
         // Input layernorm.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor ln_1w = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        Tensor ln_1b = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor ln_1_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        LayerNorm ln_1{ln_1w, ln_1b, ln_1_acv};
+        read_into_weight(fin, block.attn_ln.weight);
+        read_into_weight(fin, block.attn_ln.bias);
 
         // MLP fully-connected layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor mlp_fcw = read_weight(fin, pool, {4 * config_.n_embed, config_.n_embed}, inference_opts.debug_mode);
-        Tensor mlp_fcb = read_weight(fin, pool, {4 * config_.n_embed}, inference_opts.debug_mode);
-        const Tensor mlp_fc_acv{pool, {max_ctx, 4 * config_.n_embed}, kFloat16};
-        Linear mlp_fc{mlp_fcw, mlp_fcb, mlp_fc_acv};
+        read_into_weight(fin, block.mlp_fc.weight);
+        read_into_weight(fin, block.mlp_fc.bias);
 
         // MLP out projection layer.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor mlp_projw = read_weight(fin, pool, {config_.n_embed, 4 * config_.n_embed}, inference_opts.debug_mode);
-        Tensor mlp_projb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor mlp_proj_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Linear mlp_proj{mlp_projw, mlp_projb, mlp_proj_acv};
+        read_into_weight(fin, block.mlp_proj.weight);
+        read_into_weight(fin, block.mlp_proj.bias);
 
         // Attention layernorm.
         read_layer_header(fin, inference_opts.debug_mode);
-        Tensor ln_2w = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        Tensor ln_2b = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-        const Tensor ln_2_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        LayerNorm ln_2{ln_2w, ln_2b, ln_2_acv};
-
-        // Multihead self attn activ.
-        const Tensor qk_acv{pool, {config_.n_head, max_ctx, max_ctx}, kFloat16};
-        const Tensor qkv_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        MultiHeadSelfAttn self_attn{query, key, value, out_proj, qk_acv, qkv_acv, config_.n_head};
-
-        // GELU acv.
-        const Tensor gelu_acv{pool, {max_ctx, 4 * config_.n_embed}, kFloat16};
-        GELU gelu{gelu_acv};
-
-        // Attn inp residual acv.
-        const Tensor inp_res_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Residual inp_res{inp_res_acv};
-        const Tensor attn_res_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-        Residual attn_res{attn_res_acv};
-
-        ResidualAttentionBlock bl(self_attn, ln_1, mlp_fc, mlp_proj, ln_2, gelu, inp_res, attn_res, config_.n_ctx, config_.n_embed);
-        blocks_.push_back(std::move(bl));
+        read_into_weight(fin, block.mlp_ln.weight);
+        read_into_weight(fin, block.mlp_ln.bias);
     }
     
     // Block output Layernorm.
     read_layer_header(fin, inference_opts.debug_mode);
-    Tensor ln_fw = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-    Tensor ln_fb = read_weight(fin, pool, {config_.n_embed}, inference_opts.debug_mode);
-    const Tensor ln_f_acv{pool, {max_ctx, config_.n_embed}, kFloat16};
-    ln_f_ = LayerNorm{ln_fw, ln_fb, ln_f_acv};
+    read_into_weight(fin, model->ln_f_.weight);
+    read_into_weight(fin, model->ln_f_.bias);
+
+    timer.stop();
+    model->time_load_ms_ = load_time_ms;
+
+    return model;
 }

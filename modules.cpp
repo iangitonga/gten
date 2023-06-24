@@ -25,68 +25,66 @@
         "Expected tensor to have dim-%d=%d but got dim-%d=%d.",       \
         dim, expected_dimsize, dim, inp_dimsize)
 
-// #define GTEN_CHECK_INP_CTX_SIZE(inp_ctx_size, max_ctx_size)                  \
-//     GTEN_ASSERT(                                                             \
-//         inp_ctx_size <= max_ctx_size,                                        \
-//         "The given input's context size=%d exceeds max context size of %d.", \
-//         inp_ctx_size,                                                        \
+// #define GTEN_CHECK_INP_CTX_SIZE(inp_ctx_size, max_ctx_size)                  
+//     GTEN_ASSERT(                                                             
+//         inp_ctx_size <= max_ctx_size,                                        
+//         "The given input's context size=%d exceeds max context size of %d.", 
+//         inp_ctx_size,                                                        
 //         max_ctx_size)
 
 #define GTEN_CHECK_INP_CTX_SIZE(inp_ctx_size, max_ctx_size)
 
 
+// Activate max ctx.
+// Check values not negative.
+// Replace gelu w tables.
 
-namespace gten
-{
 
-Embedding::Embedding(const Tensor& weight, const Tensor& emb_acv, const Tensor& proj_acv)
-    : weight_{weight}, emb_acv_{emb_acv}, proj_acv_{proj_acv}
+namespace gten {
+
+Embedding::Embedding(int n_vocab, int d_embed, int max_ctx)
+    : weight{Tensor({n_vocab, d_embed}, kFloat16)},
+      emb_acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+      proj_acv_{Tensor({n_vocab}, kFloat32)},
+      max_ctx_(max_ctx)
 {
-    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
-    GTEN_CHECK_NDIMS_EQUAL(emb_acv_.ndims(), 2);
-    GTEN_CHECK_NDIMS_EQUAL(proj_acv_.ndims(), 1);
-    GTEN_ASSERT(
-        proj_acv_.dtype() == kFloat32,
-        "proj_acv tensor is expected to have dtype Float32 but got %s instead.",
-        dtype_str(proj_acv_.dtype()));
 }
 
-Tensor Embedding::forward(const Tensor& inp)
+Tensor Embedding::forward(const Tensor& tokens)
 {
-    Timer timer{&time_embed_ms_};
+    Timer timer{&exec_time_emb_ms_};
 
-    GTEN_CHECK_DTYPE_EQUAL(inp.dtype(), kInt32);
-    GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 1);
-    int max_ctx = emb_acv_.size(0);
-    GTEN_CHECK_INP_CTX_SIZE(inp.numel(), max_ctx);
+    GTEN_CHECK_DTYPE_EQUAL(tokens.dtype(), kInt32);
+    GTEN_CHECK_NDIMS_EQUAL(tokens.ndims(), 1);
+    GTEN_CHECK_INP_CTX_SIZE(tokens.numel(), max_ctx_);
     
-    return forward_impl(inp);
+    return forward_impl(tokens);
 }
 
 Tensor Embedding::forward_impl(const Tensor& inp)
 {
-    const int n_embed = weight_.size(1);
-    emb_acv_.resize({inp.numel(), n_embed});
+    const int d_embed = weight.size(1);
+    emb_acv_.resize({inp.numel(), d_embed});
     Float16* out_data = emb_acv_.data_ptr<Float16>();
     const Int32* inp_data = inp.data_ptr<Int32>();
-    Float16* weight_data = weight_.data_ptr<Float16>();
+    Float16* weight_data = weight.data_ptr<Float16>();
 
     if (emb_acv_cached_) {
         const int token_i = inp.numel() - 1;
-        const int emb_i = inp_data[token_i] * n_embed;
+        const int emb_i = inp_data[token_i] * d_embed;
         void *src = reinterpret_cast<void*>(weight_data + emb_i);
-        void *dest = reinterpret_cast<void*>(out_data + token_i * n_embed);
-        std::memcpy(dest, src, n_embed * weight_.itemsize());
+        void *dest = reinterpret_cast<void*>(out_data + token_i * d_embed);
+        std::memcpy(dest, src, d_embed * weight.itemsize());
     }
     else {
         emb_acv_cached_ = true;
 
         const int ntokens = inp.numel();
         for (int token_i = 0; token_i < ntokens; token_i++) {
-            int emb_i = inp_data[token_i] * n_embed;
+            int emb_i = inp_data[token_i] * d_embed;
             void *src = reinterpret_cast<void*>(weight_data + emb_i);
-            void *dest = reinterpret_cast<void*>(out_data + token_i * n_embed);
-            std::memcpy(dest, src, n_embed * weight_.itemsize());
+            void *dest = reinterpret_cast<void*>(out_data + token_i * d_embed);
+            std::memcpy(dest, src, d_embed * weight.itemsize());
         }
     }
 
@@ -96,30 +94,32 @@ Tensor Embedding::forward_impl(const Tensor& inp)
 
 Tensor Embedding::forward_proj(const Tensor &inp)
 {
-    Timer timer(&time_project_ms_);
+    Timer timer(&exec_time_proj_ms_);
 
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight_.size(1));
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight.size(1));
+    GTEN_CHECK_INP_CTX_SIZE(inp.size(0), max_ctx_);
 
     return forward_proj_impl(inp);
 }
 
-Tensor Embedding::forward_proj_impl(const Tensor& inp) {
+Tensor Embedding::forward_proj_impl(const Tensor& inp)
+{
     // Output probs must be float32.
     Float32* out_data = proj_acv_.data_ptr<Float32>();
     const Float16* inp_data = inp.data_ptr<Float16>();
-    const Float16* weight_data = weight_.data_ptr<Float16>();
+    const Float16* weight_data = weight.data_ptr<Float16>();
 
-    const int n_vocab = weight_.size(0);
+    const int n_vocab = weight.size(0);
     const int ctx_i = inp.size(0) - 1;
-    const int n_embed = inp.size(1);
+    const int d_embed = inp.size(1);
 
     for (int emb_i = 0; emb_i < n_vocab; emb_i++)
     {
         Vec_f32x8 dot_accum = { vec_f32x8_setzero() };
-        for (int i = 0; i < n_embed; i += 8) {
-            Vec_f32x8 x = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
-            Vec_f32x8 w = vec_f32x8_load(weight_data + (emb_i * n_embed + i));
+        for (int i = 0; i < d_embed; i += 8) {
+            Vec_f32x8 x = vec_f32x8_load(inp_data + (ctx_i * d_embed + i));
+            Vec_f32x8 w = vec_f32x8_load(weight_data + (emb_i * d_embed + i));
             dot_accum = vec_f32x8_fma(x, w, dot_accum);
         }
         out_data[emb_i] = vec_f32x8_sum(dot_accum);
@@ -128,49 +128,56 @@ Tensor Embedding::forward_proj_impl(const Tensor& inp) {
     return proj_acv_;  
 }
 
-PosEmbedding::PosEmbedding(const Tensor& weight, int max_ctx)
-    : weight_{weight}, max_ctx_(max_ctx)
+PosEmbedding::PosEmbedding(int max_ctx, int d_embed)
+    : weight{Tensor({max_ctx, d_embed}, kFloat16)}, max_ctx_(max_ctx)
 {
-    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
 }
 
 Tensor PosEmbedding::forward(int n_ctx)
 {
     GTEN_CHECK_INP_CTX_SIZE(n_ctx, max_ctx_);
 
-    Timer timer{&time_ms_};
+    Timer timer{&exec_time_ms_};
     
     return forward_impl(n_ctx);
 }
 
 Tensor PosEmbedding::forward_impl(int n_ctx)
 {
-    const Float16* weight_data = weight_.data_ptr<Float16>();
+    const Float16* weight_data = weight.data_ptr<Float16>();
 
     void* src_ptr = (void*)weight_data;
-    const int n_embed = weight_.size(1);
-    Tensor acv{src_ptr, {n_ctx, n_embed}, weight_.dtype()};
+    const int d_embed = weight.size(1);
+
+    // Shares the data with the weight.
+    Tensor acv{src_ptr, {n_ctx, d_embed}, weight.dtype()};
 
     return acv;
 }
 
-LayerNorm::LayerNorm(const Tensor& weight, const Tensor& bias, const Tensor& acv)
-    : weight_{weight}, bias_{bias}, acv_{acv}
+LayerNorm::LayerNorm(int max_ctx, int d_embed)
+    : weight{Tensor({d_embed}, kFloat16)},
+      bias{Tensor({d_embed}, kFloat16)},
+      acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+      max_ctx_{max_ctx}
 {
-    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 1);
-    GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
 
 
 Tensor LayerNorm::forward(const Tensor &inp)
 {
-    Timer timer(&time_ms_);
+    Timer timer(&exec_time_ms_);
 
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    const int n_embed = weight_.size(0);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_embed);
+    const int d_embed = weight.size(0);
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), d_embed);
 
     return forward_impl(inp);
+}
+
+template<typename T>
+T* get_ptr() {
+    return reinterpret_cast<T*>(nullptr);
 }
 
 Tensor LayerNorm::forward_impl(const Tensor &inp)
@@ -178,31 +185,31 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
     acv_.resize({inp.size(0), inp.size(1)});
     Float16* acv_data = acv_.data_ptr<Float16>();
     const Float16* inp_data = inp.data_ptr<Float16>();
-    const Float16* weight_data = weight_.data_ptr<Float16>();
-    const Float16* bias_data = bias_.data_ptr<Float16>();
+    const Float16* weight_data = weight.data_ptr<Float16>();
+    const Float16* bias_data = bias.data_ptr<Float16>();
 
     const int n_ctx = inp.size(0);
-    const int n_embed = weight_.size(0);
+    const int d_embed = weight.size(0);
 
     if (acv_cached_)
     {
-        const int ctx_offset = (n_ctx - 1) * n_embed;
+        const int ctx_offset = (n_ctx - 1) * d_embed;
         // Mean calculation.
         Float32 mean_accum = 0.0f;
-        for (int i = 0; i < n_embed; i++)
+        for (int i = 0; i < d_embed; i++)
             mean_accum += fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
-        Float32 mean = mean_accum / (Float32)n_embed;
+        Float32 mean = mean_accum / (Float32)d_embed;
 
         // Standard deviation calculation.
         Float32 variance_accum = 0.0f;
-        for (int i = 0; i < n_embed; i++) {
+        for (int i = 0; i < d_embed; i++) {
             Float32 x = fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
             variance_accum += (x - mean) * (x - mean);
         }
-        Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed);
+        Float32 std_dev = std::sqrt(variance_accum / (Float32)d_embed);
 
         // Normalization.
-        for (int i = 0; i < n_embed; i++) {
+        for (int i = 0; i < d_embed; i++) {
             Float32 unnormalized = fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
             Float32 w = fpcvt_to_fp32<Float16>(weight_data[i]);
             Float32 b = fpcvt_to_fp32<Float16>(bias_data[i]);
@@ -216,24 +223,24 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
 
         for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++)
         {
-            const int ctx_offset = ctx_i * n_embed;
+            const int ctx_offset = ctx_i * d_embed;
 
             // Mean calculation.
             Float32 mean_accum = 0.0f;
-            for (int i = 0; i < n_embed; i++)
+            for (int i = 0; i < d_embed; i++)
                 mean_accum += fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
-            Float32 mean = mean_accum / (Float32)n_embed;
+            Float32 mean = mean_accum / (Float32)d_embed;
 
             // Standard deviation calculation.
             Float32 variance_accum = 0.0f;
-            for (int i = 0; i < n_embed; i++) {
+            for (int i = 0; i < d_embed; i++) {
                 Float32 x = fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
                 variance_accum += (x - mean) * (x - mean);
             }
-            Float32 std_dev = std::sqrt(variance_accum / (Float32)n_embed);
+            Float32 std_dev = std::sqrt(variance_accum / (Float32)d_embed);
 
             // Normalization.
-            for (int i = 0; i < n_embed; i++) {
+            for (int i = 0; i < d_embed; i++) {
                 Float32 x = fpcvt_to_fp32<Float16>(inp_data[i + ctx_offset]);
                 Float32 w = fpcvt_to_fp32<Float16>(weight_data[i]);
                 Float32 b = fpcvt_to_fp32<Float16>(bias_data[i]);
@@ -248,68 +255,62 @@ Tensor LayerNorm::forward_impl(const Tensor &inp)
 }
 
 
-GELU::GELU(const Tensor& acv)
-    : acv_{acv}
+GELU::GELU(int max_ctx, int d_out, bool cache_ctx_acv)
+    : acv_{Tensor({max_ctx, d_out}, kFloat16)}, cache_acv_{cache_ctx_acv}
 {
 }
 
-
 Tensor GELU::forward(const Tensor& inp)
 {
-    Timer timer{&time_ms_};
+    Timer timer{&exec_time_ms_};
 
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    const int n_out = acv_.size(1);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_out);
+    // GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), n_out);
+    // Assert inp numel = acv numel.
+    // Resize acv to inp shape.
 
     return forward_impl(inp);
 }
 
 Tensor GELU::forward_impl(const Tensor& inp)
 {
-    // TODO: Replace with tables.
+    // TODO: Replace with lookup table.
     const int n_ctx = inp.size(0);
-    const int n_out = acv_.size(1);
+    const int d_out = acv_.size(1);
 
-    acv_.resize({n_ctx, n_out});
+    acv_.resize({n_ctx, d_out});
     Float16* acv_data = acv_.data_ptr<Float16>();
     const Float16* inp_data = inp.data_ptr<Float16>();
 
-    const int ne = inp.numel();
-    if (acv_cached_) {
-        const int start_i = (n_ctx - 1) * n_out;
-        Float32 x;
-        for (int i = start_i; i < ne; ++i) {
-            x = fpcvt_to_fp32<Float16>(inp_data[i]);
-            Float32 res = 0.5 * x 
-                              * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
-                              * (x + 0.044715f * std::pow(x, 3.0f))));
-            acv_data[i] = fpcvt_from_fp32<Float16>(res);
-        }
-    }
-    else {
-        acv_cached_ = true;
 
-        Float32 x;
-        for (int i = 0; i < ne; ++i) {
-            x = fpcvt_to_fp32<Float16>(inp_data[i]);
-            Float32 res = 0.5 * x 
-                              * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
-                              * (x + 0.044715f * std::pow(x, 3.0f))));
-            acv_data[i] = fpcvt_from_fp32<Float16>(res);
-        }
+    int start_idx;
+    if (cache_acv_ && acv_cached_) {
+        start_idx = (n_ctx - 1) * d_out;
+    } else {
+        start_idx = 0;
+        acv_cached_ = true;
     }
+
+    const int ne = inp.numel();
+    for (int i = start_idx; i < ne; ++i) {
+        Float32 x = fpcvt_to_fp32<Float16>(inp_data[i]);
+        Float32 res = 0.5 * x 
+                            * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
+                            * (x + 0.044715f * std::pow(x, 3.0f))));
+        acv_data[i] = fpcvt_from_fp32<Float16>(res);
+    }
+    
     return acv_;
 }
 
-Residual::Residual(const Tensor& acv)
-    : acv_{acv}
+Residual::Residual(int max_ctx, int d_out)
+    : acv_{Tensor({max_ctx, d_out}, kFloat16)}
 {
 }
 
 Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1)
 {
-    Timer timer{&time_ms_};
+    Timer timer{&exec_time_ms_};
 
     GTEN_CHECK_DTYPE_EQUAL(inp0.dtype(), inp1.dtype());
     GTEN_CHECK_NDIMS_EQUAL(inp0.ndims(), 2);
@@ -322,16 +323,16 @@ Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1)
 Tensor Residual::forward_impl(const Tensor& inp0, const Tensor& inp1)
 {
     const int n_ctx = inp0.size(0);
-    const int n_embed = inp0.size(1);
+    const int d_embed = inp0.size(1);
 
-    acv_.resize({n_ctx, n_embed});
+    acv_.resize({n_ctx, d_embed});
     Float16* acv_data = acv_.data_ptr<Float16>();
     const Float16* inp0_data = inp0.data_ptr<Float16>();
     const Float16* inp1_data = inp1.data_ptr<Float16>();
 
     if (acv_cached_) {
-        uint32_t n_iter = n_embed;
-        uint32_t offset = inp0.numel() - n_embed;
+        uint32_t n_iter = d_embed;
+        uint32_t offset = inp0.numel() - d_embed;
         for (uint32_t i = 0; i < n_iter; i += 8) {
             Vec_f32x8 x0 = vec_f32x8_load(inp0_data + offset + i);
             Vec_f32x8 x1 = vec_f32x8_load(inp1_data + offset + i);
@@ -354,20 +355,20 @@ Tensor Residual::forward_impl(const Tensor& inp0, const Tensor& inp1)
     return acv_;
 }
 
-Linear::Linear(const Tensor &weight, const Tensor &bias,const Tensor& acv)
-    : weight_{weight}, bias_{bias}, acv_{acv}
+Linear::Linear(int d_in, int d_out, int max_ctx, bool cache_acv, bool transpose_out)
+    : weight{Tensor({d_out, d_in}, kFloat16)},
+      bias{Tensor({d_out}, kFloat16)},
+      acv_{Tensor({max_ctx, d_out}, kFloat16)},
+      cache_acv_{cache_acv}, transpose_out_{transpose_out}
 {
-    GTEN_CHECK_NDIMS_EQUAL(weight_.ndims(), 2);
-    GTEN_CHECK_NDIMS_EQUAL(bias_.ndims(), 1);
 }
-
 
 Tensor Linear::forward(const Tensor &inp)
 {
-    Timer timer{&time_ms_};
+    Timer timer{&exec_time_ms_};
 
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
-    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight_.size(1));
+    GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), weight.size(1));
 
     return forward_impl(inp);
 }
@@ -375,71 +376,217 @@ Tensor Linear::forward(const Tensor &inp)
 Tensor Linear::forward_impl(const Tensor& inp)
 {
     const int n_ctx = inp.size(0);
-    const int n_embed = inp.size(1);
-    const int n_out = weight_.size(0);
+    const int d_embed = inp.size(1);
+    const int d_out = weight.size(0);
     
-    acv_.resize({n_ctx, n_out});
+    acv_.resize({n_ctx, d_out});
     Float16* acv_data = acv_.data_ptr<Float16>();
-    const Float16* weight_data = weight_.data_ptr<Float16>();
-    const Float16* bias_data = bias_.data_ptr<Float16>();
+    const Float16* weight_data = weight.data_ptr<Float16>();
+    const Float16* bias_data = bias.data_ptr<Float16>();
     const Float16* inp_data = inp.data_ptr<Float16>();
 
-    if (acv_cached_)
-    {
-        const int ctx_i = n_ctx - 1;
-        for (int out_i = 0; out_i < n_out; out_i++) {
+    int ctx_start_idx;
+    if (cache_acv_ && acv_cached_) {
+        ctx_start_idx = n_ctx - 1;
+    } else {
+        ctx_start_idx = 0;
+        acv_cached_ = true;
+    }
+
+    for (int ctx_idx = ctx_start_idx; ctx_idx < n_ctx; ctx_idx++) {
+        for (int out_idx = 0; out_idx < d_out; out_idx++) {
             Vec_f32x8 dot_accum = vec_f32x8_setzero();
-            for (int i = 0; i < n_embed; i += 8) {
-                Vec_f32x8 x0 = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
-                Vec_f32x8 x1 = vec_f32x8_load(weight_data + (out_i * n_embed + i));
+            for (int i = 0; i < d_embed; i += 8) {
+                Vec_f32x8 x0 = vec_f32x8_load(inp_data + (ctx_idx * d_embed + i));
+                Vec_f32x8 x1 = vec_f32x8_load(weight_data + (out_idx * d_embed + i));
                 dot_accum = vec_f32x8_fma(x0, x1, dot_accum);
             }
-            Float32 bias = fpcvt_to_fp32<Float16>(bias_data[out_i]);
+            Float32 bias = fpcvt_to_fp32<Float16>(bias_data[out_idx]);
             Float32 res =  vec_f32x8_sum(dot_accum) + bias;
-            acv_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<Float16>(res);
-        }
-    }
-    else
-    {
-        acv_cached_ = true;
-        for (int ctx_i = 0; ctx_i < n_ctx; ctx_i++) {
-            for (int out_i = 0; out_i < n_out; out_i++) {
-                Vec_f32x8 dot_accum = vec_f32x8_setzero();
-                for (int i = 0; i < n_embed; i += 8) {
-                    Vec_f32x8 x0 = vec_f32x8_load(inp_data + (ctx_i * n_embed + i));
-                    Vec_f32x8 x1 = vec_f32x8_load(weight_data + (out_i * n_embed + i));
-                    dot_accum = vec_f32x8_fma(x0, x1, dot_accum);
-                }
-                Float32 bias = fpcvt_to_fp32<Float16>(bias_data[out_i]);
-                Float32 res =  vec_f32x8_sum(dot_accum) + bias;
-                acv_data[ctx_i * n_out + out_i] = fpcvt_from_fp32<Float16>(res);
-            }
+            const int out_i = transpose_out_ ? out_idx * n_ctx + ctx_idx : ctx_idx * d_out + out_idx;
+            acv_data[out_i] = fpcvt_from_fp32<Float16>(res);
         }
     }
 
     return acv_;
 }
 
-MultiHeadSelfAttn::MultiHeadSelfAttn(const Linear& query, const Linear& key,
-                                     const Linear& value, const Linear& out_proj,
-                                     const Tensor& qk_acv, const Tensor& qkv_acv,
-                                     int n_head)
-    : query_{query}, key_{key}, value_{value}, qkv_proj_{out_proj}, qk_acv_{qk_acv},
-      qkv_acv_{qkv_acv}, n_head_{n_head}
+
+static void qk_attn_matmul(const Tensor& q, const Tensor& k, Tensor& qk_out,
+                           const int n_head, const bool mask_output, int ctx_offset=0)
 {
-    if (qk_acv_.dtype() == kFloat16) {
-        Float16 *qk_cache_data = qk_acv_.data_ptr<Float16>();
-        const int ne = qk_acv_.numel();
-        const Float16 inf = fp32_to_fp16(-INFINITY);
-        for (int i = 0; i < ne; i++)
-            qk_cache_data[i] = inf;
+    const int q_ctx = q.size(0);
+    const int d_embed = q.size(1);
+    const int k_ctx = k.size(0);
+    const int d_head = d_embed / n_head;
+    const Float32 scale_factor = 1.0f / std::sqrt((Float32)d_head);
+
+    const Float16* q_data = q.data_ptr<Float16>();
+    const Float16* k_data = k.data_ptr<Float16>();
+    Float16* qk_data = qk_out.data_ptr<Float16>();
+
+    for (int head = 0; head < n_head; head++) {
+        for (int q_row = ctx_offset; q_row < q_ctx; q_row++) {
+            const int k_max = mask_output ? q_row + 1 : k_ctx;
+            for (int k_col = 0; k_col < k_max; k_col++) {
+                Vec_f32x8 dot_accum = { vec_f32x8_setzero() };
+                for (int i = 0; i < d_head; i += 8) {
+                    int q_idx = head * d_head + q_row * d_embed + i;
+                    int k_idx = head * d_head + k_col * d_embed + i;
+                    Vec_f32x8 qw = vec_f32x8_load(q_data + q_idx);
+                    Vec_f32x8 kw = vec_f32x8_load(k_data + k_idx);
+                    dot_accum = vec_f32x8_fma(qw, kw, dot_accum);
+                }
+                int qk_data_i = head * q_ctx * k_ctx + q_row * k_ctx + k_col;
+                qk_data[qk_data_i] = fpcvt_from_fp32<Float16>(vec_f32x8_sum(dot_accum) * scale_factor);
+            }
+        }
     }
-    else {
-        Float32 *qk_cache_data = qk_acv_.data_ptr<Float32>();
-        const int ne = qk_acv_.numel();
-        for (int i = 0; i < ne; i++)
-            qk_cache_data[i] = -INFINITY;
+
+    if (mask_output) {
+        for (int head = 0; head < n_head; head++) {
+            for (int q_row = ctx_offset; q_row < q_ctx; q_row++) {
+                const int k_start = q_row + 1;
+                for (int k_col = k_start; k_col < k_ctx; k_col++) {
+                    int qk_data_i = head * q_ctx * k_ctx + q_row * k_ctx + k_col;
+                    // Use memcpy?
+                    qk_data[qk_data_i] = fpcvt_from_fp32<Float16>(-INFINITY);
+                }
+            }
+        }
     }
+}
+
+static void qk_softmax(Tensor& qk_acv, int n_heads, int ctx_offset=0)
+{
+    Float16* qk_data = qk_acv.data_ptr<Float16>();
+
+    const int q_ctx = qk_acv.size(1);
+    const int k_ctx = qk_acv.size(2);
+
+    for (int head = 0; head < n_heads; head++) {
+        for (int q_row = ctx_offset; q_row < q_ctx; q_row++)
+        {
+            Float32 max = -INFINITY;
+
+            const int base_idx = head * q_ctx * k_ctx + q_row * k_ctx;
+
+            for (int i = 0; i < k_ctx; i++) {
+                Float32 x = fpcvt_to_fp32(qk_data[base_idx + i]);
+                if (x > max)
+                    max = x;
+            }
+
+            Float32 sum_exp = 0;
+            for (int i = 0; i < k_ctx; i++) {
+                Float32 x = fpcvt_to_fp32(qk_data[base_idx + i]);
+                Float32 exp_val = std::exp(x - max);
+                qk_data[base_idx + i] = fpcvt_from_fp32<Float16>(exp_val);
+                sum_exp += exp_val;
+            }
+
+            for (int i = 0; i < k_ctx; i++) {
+                Float32 qkw = fpcvt_to_fp32(qk_data[base_idx + i]);
+                qk_data[base_idx + i] = fpcvt_from_fp32<Float16>(qkw / sum_exp);
+            }
+        }
+    }
+}
+
+static void qkv_attn_matmul(const Tensor& qk, const Tensor& v, Tensor& qkv_acv, int n_head, int ctx_offset=0)
+{
+    const Float16* qk_data = qk.data_ptr<Float16>();
+    const Float16* v_data = v.data_ptr<Float16>();
+    Float16* qkv_data = qkv_acv.data_ptr<Float16>();
+
+    const int q_ctx = qk.size(1);
+    const int kv_ctx = qk.size(2);
+    const int d_embed = v.size(1);
+    const int d_head = d_embed / n_head;
+
+    const int vec_niter = kv_ctx / 8;
+    const int vec_n_ctx = vec_niter * 8;
+
+    for (int head = 0; head < n_head; head++)
+    {
+        for (int qk_row = ctx_offset; qk_row < q_ctx; qk_row++)
+        {
+            for (int v_row = 0; v_row < d_head; v_row++)
+            {
+                float dot_prod = 0.0f;
+                Vec_f32x8 dot_prod_accum = { vec_f32x8_setzero() };
+
+                for (int i = 0; i < vec_n_ctx; i += 8)
+                {
+                    const int qk_i = head * q_ctx * kv_ctx + qk_row * kv_ctx + i;
+                    const int v_i = head * kv_ctx * d_head + v_row*kv_ctx + i;
+
+                    Vec_f32x8 qkw = vec_f32x8_load(qk_data + qk_i);
+                    Vec_f32x8 vw = vec_f32x8_load(v_data + v_i);
+                    dot_prod_accum = vec_f32x8_fma(qkw, vw, dot_prod_accum);
+                }
+                dot_prod = vec_f32x8_sum(dot_prod_accum);
+
+                for (int i = vec_n_ctx; i < kv_ctx; i++)
+                {
+                    const int qk_i = head * q_ctx * kv_ctx + qk_row * kv_ctx + i;
+                    const int v_i = head * kv_ctx * d_head + v_row*kv_ctx + i;
+                    Float32 qkw = fpcvt_to_fp32(qk_data[qk_i]);
+                    Float32 vw = fpcvt_to_fp32(v_data[v_i]);
+                    dot_prod += qkw*vw;
+                }
+
+                int qkv_data_i = head * d_head + qk_row * d_embed + v_row;
+                qkv_data[qkv_data_i] = fpcvt_from_fp32<Float16>(dot_prod);
+            }
+        }
+    }
+}
+
+
+// Like fn above where v is not transposed.
+// TODO: Implement Linear module where output is cached and transposed.
+static void qkv_attn_matmul_nt(const Tensor& qk, const Tensor& v, Tensor& qkv_acv, int n_heads, int ctx_offset=0)
+{
+    const Float16* qk_data = qk.data_ptr<Float16>();
+    const Float16* v_data = v.data_ptr<Float16>();
+    Float16* qkv_data = qkv_acv.data_ptr<Float16>();
+
+    const int q_ctx = qk.size(1);
+    const int kv_ctx = qk.size(2);
+    const int d_embed = v.size(1);
+    const int d_head = d_embed / n_heads;
+
+    for (int head = 0; head < n_heads; head++) {
+        for (int qk_row = ctx_offset; qk_row < q_ctx; qk_row++){
+            for (int v_col = 0; v_col < d_head; v_col++) {
+                Float32 dot_prod = 0;
+                for (int i = 0; i < kv_ctx; i++) {
+                    int qk_i = head * q_ctx * kv_ctx + qk_row * kv_ctx + i;
+                    int v_i = head * d_head + i * d_embed + v_col;
+                    Float32 qkw =fpcvt_to_fp32<Float16>(qk_data[qk_i]);
+                    Float32 vw = fpcvt_to_fp32<Float16>(v_data[v_i]);
+                    dot_prod += qkw * vw;
+                }
+                int qkv_data_i = head * d_head + qk_row * d_embed + v_col;
+                qkv_data[qkv_data_i] = fpcvt_from_fp32<Float16>(dot_prod);
+            }
+        }
+    }
+
+}
+
+MultiHeadSelfAttn::MultiHeadSelfAttn(int n_head, int d_embed, int max_ctx, bool mask_attn, bool cache_v_ctx)
+    : query{Linear(d_embed, d_embed, max_ctx, /*cache_acv=*/mask_attn)},
+      key{Linear(d_embed, d_embed, max_ctx, /*cache_acv=*/mask_attn)},
+      value{Linear(d_embed, d_embed, max_ctx, /*cache_acv=*/cache_v_ctx, /*transpose_out=*/!cache_v_ctx)},
+      qkv_proj{Linear(d_embed, d_embed, max_ctx, /*cache_acv=*/mask_attn)},
+      qk_acv_{Tensor({n_head, max_ctx, max_ctx}, kFloat16)},
+      qkv_acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+      n_heads_{n_head},
+      mask_attn_{mask_attn},
+      cache_v_ctx_{cache_v_ctx}
+{
 }
 
 Tensor MultiHeadSelfAttn::forward(const Tensor &inp)
@@ -447,200 +594,318 @@ Tensor MultiHeadSelfAttn::forward(const Tensor &inp)
     GTEN_CHECK_NDIMS_EQUAL(inp.ndims(), 2);
     GTEN_CHECK_DIMSIZE_EQUAL(1, inp.size(1), qkv_acv_.size(1));
 
-    const int n_ctx = inp.size(0);
-    const int n_embed = inp.size(1);
+    Tensor q = query.forward(inp);
+    Tensor k = key.forward(inp);
+    Tensor v = value.forward(inp);
 
-    Tensor q = query_.forward(inp);
-    Tensor k = key_.forward(inp);
-    Tensor v = value_.forward(inp);
-
-    const Tensor qkv = qkv_attn(q, k, v);
-    const Tensor out = qkv_proj_.forward(qkv);
+    const Tensor qkv = mask_attn_ ? masked_qkv_attn(q, k, v)
+                                  : non_masked_qkv_attn(q, k, v);
+    const Tensor out = qkv_proj.forward(qkv);
     return out;
 }
 
-Tensor MultiHeadSelfAttn::qkv_attn(const Tensor &q, const Tensor &k, const Tensor &v)
+
+Tensor MultiHeadSelfAttn::masked_qkv_attn(const Tensor &q, const Tensor &k, const Tensor &v)
 {
-    Timer timer(&time_attn_ms_);
+    Timer timer{&time_attn_ms_};
 
     const int n_ctx = q.size(0);
-    const int n_embed = q.size(1);
-    const int d_head = n_embed / n_head_;
+    const int d_embed = q.size(1);
+    qk_acv_.resize({n_heads_, n_ctx, n_ctx});
+    qkv_acv_.resize({n_ctx, d_embed});
 
-    const Float16* q_data = q.data_ptr<Float16>();
-    const Float16* k_data = k.data_ptr<Float16>();
-
-    qk_acv_.resize({n_head_, n_ctx, n_ctx});
-    Float16* qk_data = qk_acv_.data_ptr<Float16>();
-
-    qkv_acv_.resize({n_ctx, n_embed});
-    Float16* qkv_data = qkv_acv_.data_ptr<Float16>();
-    const Float16* v_data = v.data_ptr<Float16>();
-
-    Float32 scale_factor = 1.0f / std::sqrt((Float32)d_head);
-    if (qkv_cached_)
-    {
-        // SCALED DOT-PRODUCT: (Q @ K) * scale.
-        for (int head = 0; head < n_head_; head++)
-        {
-            const int q_row = n_ctx - 1;
-            for (int k_col = 0; k_col < n_ctx; k_col++) {
-                Vec_f32x8 dot_accum = vec_f32x8_setzero();
-                for (int i = 0; i < d_head; i += 8) {
-                    int q_i = head * d_head + q_row * n_embed + i;
-                    int k_i = head * d_head + k_col * n_embed + i;
-                    Vec_f32x8 qw = vec_f32x8_load(q_data + q_i);
-                    Vec_f32x8 kw = vec_f32x8_load(k_data + k_i);
-                    dot_accum = vec_f32x8_add(vec_f32x8_mul(qw, kw), dot_accum);
-                }
-                Float32 dot_prod = vec_f32x8_sum(dot_accum) * scale_factor;
-                int qk_data_i = head * n_ctx * n_ctx + q_row * n_ctx + k_col;
-                qk_data[qk_data_i] = fpcvt_from_fp32<Float16>(dot_prod);
-            }
-        }
-
-        // SOFTMAX
-        for (int head = 0; head < n_head_; head++)
-        {
-            const int row = n_ctx - 1;
-            const int base_i = head * n_ctx * n_ctx + row * n_ctx;
-
-            Float32 max = -INFINITY;
-            for (int i = 0; i < n_ctx; i++) {
-                Float32 val = fpcvt_to_fp32<Float16>(qk_data[base_i + i]);
-                if (val > max)
-                    max = val;
-            }
-
-            Float32 sum_exp = 0;
-            for (int i = 0; i < n_ctx; i++) {
-                int qk_i = base_i + i;
-                Float32 val = fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-                qk_data[qk_i] = fpcvt_from_fp32<Float16>(std::exp(val - max));
-                sum_exp += fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-            }
-
-            for (int i = 0; i < n_ctx; i++) {
-                Float32 qkw = fpcvt_to_fp32<Float16>(qk_data[base_i + i]);
-                qk_data[base_i + i] = fpcvt_from_fp32<Float16>(qkw / sum_exp);
-            }
-        }
-
-        // ATTENTION: QK @ V
-        for (int head = 0; head < n_head_; head++)
-        {
-            const int qk_row = n_ctx - 1;
-            for (int v_col = 0; v_col < d_head; v_col++) {
-                Float32 dot_prod = 0;
-                for (int i = 0; i < n_ctx; i++) {
-                    int qk_i = head * n_ctx * n_ctx + qk_row * n_ctx + i;
-                    int v_i = head * d_head + i * n_embed + v_col;
-                    Float32 qkw = fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-                    Float32 vw = fpcvt_to_fp32<Float16>(v_data[v_i]);
-                    dot_prod += qkw * vw;
-                }
-                int qkv_data_i = head * d_head + qk_row * n_embed + v_col;
-                qkv_data[qkv_data_i] = fpcvt_from_fp32<Float16>(dot_prod);
-            }
+    if (qkv_cached_) {
+        qk_attn_matmul(q,k, qk_acv_, n_heads_, /*masked=*/true, /*ctx_offset=*/n_ctx-1);
+        qk_softmax(qk_acv_, n_heads_, /*ctx_offset=*/n_ctx-1);
+        if (cache_v_ctx_) {
+            qkv_attn_matmul_nt(qk_acv_, v, qkv_acv_, n_heads_, /*ctx_offset=*/n_ctx-1);
+        } else {
+            qkv_attn_matmul(qk_acv_, v, qkv_acv_, n_heads_, /*ctx_offset=*/n_ctx-1);
         }
     }
-    else
-    {
+    else {
         qkv_cached_ = true;
 
-        // SCALED DOT-PRODUCT: (Q @ K) * scale.
-        for (int head = 0; head < n_head_; head++)
-        {
-            for (int q_row = 0; q_row < n_ctx; q_row++)
-            {
-                // `non_masked_prods` represents the number of dot products that will
-                // not be masked and therefore must be computed. This allows us to skip
-                // unecessary dot products.
-                int non_masked_prods = q_row + 1;
-                for (int k_col = 0; k_col < non_masked_prods; k_col++) {
-                    Float32 dot_accum = 0.0f;
-                    for (int i = 0; i < d_head; i++) {
-                        int q_i = head * d_head + q_row * n_embed + i;
-                        int k_i = head * d_head + k_col * n_embed + i;
-                        Float32 qw = fpcvt_to_fp32<Float16>(q_data[q_i]);
-                        Float32 kw = fpcvt_to_fp32<Float16>(k_data[k_i]);
-                        dot_accum += qw * kw * scale_factor;
-                    }
-                    int qk_data_i = head * n_ctx * n_ctx + q_row * n_ctx + k_col;
-                    qk_data[qk_data_i] = fpcvt_from_fp32<Float16>(dot_accum);
-                }
-
-            }
-        }
-
-        // SOFTMAX
-        int n_rows = n_head_ * n_ctx;
-        for (int row = 0; row < n_rows; row++)
-        {
-            Float32 max = -INFINITY;
-            for (int i = 0; i < n_ctx; i++) {
-                Float32 x = fpcvt_to_fp32<Float16>(qk_data[row * n_ctx + i]);
-                if (x > max)
-                    max = x;
-            }
-
-            Float32 sum_exp = 0;
-            for (int i = 0; i < n_ctx; i++) {
-                int qk_i = row * n_ctx + i;
-                Float32 x = fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-                qk_data[qk_i] = fpcvt_from_fp32<Float16>(std::exp(x - max));
-                sum_exp += fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-            }
-
-            for (int i = 0; i < n_ctx; i++) {
-                Float32 qkw =  fpcvt_to_fp32<Float16>(qk_data[row * n_ctx + i]);
-                qk_data[row * n_ctx + i] = fpcvt_from_fp32<Float16>(qkw / sum_exp);
-            }
-        }
-
-        // ATTENTION: QK @ V
-        for (int head = 0; head < n_head_; head++)
-        {
-            for (int qk_row = 0; qk_row < n_ctx; qk_row++){
-                for (int v_col = 0; v_col < d_head; v_col++) {
-                    Float32 dot_prod = 0;
-                    for (int i = 0; i < n_ctx; i++) {
-                        int qk_i = head * n_ctx * n_ctx + qk_row * n_ctx + i;
-                        int v_i = head * d_head + i * n_embed + v_col;
-                        Float32 qkw =fpcvt_to_fp32<Float16>(qk_data[qk_i]);
-                        Float32 vw = fpcvt_to_fp32<Float16>(v_data[v_i]);
-                        dot_prod += qkw * vw;
-                    }
-                    int qkv_data_i = head * d_head + qk_row * n_embed + v_col;
-                    qkv_data[qkv_data_i] = fpcvt_from_fp32<Float16>(dot_prod);
-                }
-            }
+        qk_attn_matmul(q, k, qk_acv_, n_heads_, /*masked=*/true);
+        qk_softmax(qk_acv_, n_heads_);
+        if (cache_v_ctx_) {
+            qkv_attn_matmul_nt(qk_acv_, v, qkv_acv_, n_heads_);
+        } else {
+            qkv_attn_matmul(qk_acv_, v, qkv_acv_, n_heads_);
         }
     }
 
     return qkv_acv_;
 }
 
-ResidualAttentionBlock::ResidualAttentionBlock(const MultiHeadSelfAttn& attn,
-                                               const LayerNorm& ln_1,
-                                               const Linear& mlp_fc,
-                                               const Linear& mlp_proj,
-                                               const LayerNorm& ln_2,
-                                               const GELU& gelu,
-                                               const Residual& inp_res,
-                                               const Residual& attn_res,
-                                               int32_t max_ctx, int32_t n_embed)
-    : attn_{attn}, ln_1_{ln_1}, mlp_fc_{mlp_fc}, mlp_proj_{mlp_proj}, ln_2_{ln_2},
-      gelu_{gelu}, inp_res_{inp_res}, attn_res_{attn_res}
+
+Tensor MultiHeadSelfAttn::non_masked_qkv_attn(const Tensor &q, const Tensor &k, const Tensor &v)
+{
+    Timer timer{&time_attn_ms_};
+
+    const int n_ctx = q.size(0);
+    const int d_embed = q.size(1);
+
+    // SCALED DOT-PRODUCT: (Q @ K) * scale.
+    qk_acv_.resize({n_heads_, n_ctx, n_ctx});
+    qk_attn_matmul(q, k, qk_acv_, n_heads_, /*masked=*/false);
+
+    // SOFTMAX
+    qk_softmax(qk_acv_, n_heads_);
+
+    // ATTENTION: QK @ V
+    qkv_acv_.resize({n_ctx, d_embed});
+    qkv_attn_matmul(qk_acv_, v, qkv_acv_, n_heads_);
+
+    return qkv_acv_;
+}
+
+
+MultiHeadCrossAttn::MultiHeadCrossAttn(int attn_heads, int d_embed, int max_q_ctx, int kv_ctx)
+    : query{Linear(d_embed, d_embed, max_q_ctx, /*cache_acv=*/true)},
+      key{Linear(d_embed, d_embed, kv_ctx, /*cache_acv=*/false)},
+      value{Linear(d_embed, d_embed, kv_ctx, /*cache_acv=*/false, /*transpose_out=*/true)},
+      qkv_proj{Linear(d_embed, d_embed, max_q_ctx, /*cache_acv*/false)},
+      qk_acv_{Tensor({attn_heads, max_q_ctx, kv_ctx}, kFloat16)},
+      qkv_acv_{Tensor({max_q_ctx, d_embed}, kFloat16)},
+      n_heads_{attn_heads}
 {
 }
 
-Tensor ResidualAttentionBlock::forward(const Tensor &inp)
+Tensor MultiHeadCrossAttn::forward(const Tensor& x, const Tensor& xa)
 {
-    Tensor attn = inp_res_.forward(inp, attn_.forward(ln_1_.forward(inp)));
-    Tensor out = attn_res_.forward(attn,
-        mlp_proj_.forward(gelu_.forward(mlp_fc_.forward(ln_2_.forward(attn)))));
+    GTEN_CHECK_NDIMS_EQUAL(x.ndims(), 2);
+    GTEN_CHECK_NDIMS_EQUAL(xa.ndims(), 2);
+
+    Tensor q = query.forward(x);
+    if (!kv_cached_) {
+        k_cache = key.forward(xa);
+        v_cache = value.forward(xa);
+        kv_cached_ = true;
+    }
+
+    const Tensor qkv = qkv_attn(q, k_cache, v_cache);
+    const Tensor out = qkv_proj.forward(qkv);
     return out;
+}
+
+Tensor MultiHeadCrossAttn::qkv_attn(const Tensor& q, const Tensor& k, const Tensor& v)
+{
+    const int q_ctx = q.size(0);
+    const int kv_ctx = k.size(0);
+    qk_acv_.resize({n_heads_, q_ctx, kv_ctx});
+
+    const int d_embed = k.size(1);
+    qkv_acv_.resize({q_ctx, d_embed});
+
+    if (qkv_cached_) {
+        qk_attn_matmul(q,k, qk_acv_, n_heads_, /*masked=*/false, /*ctx_offset=*/q_ctx-1);
+        qk_softmax(qk_acv_, n_heads_, /*ctx_offset=*/q_ctx-1);
+        qkv_attn_matmul(qk_acv_, v, qkv_acv_, n_heads_, /*ctx_offset=*/q_ctx-1);
+    }
+    else {
+        qkv_cached_ = true;
+
+        qk_attn_matmul(q, k, qk_acv_, n_heads_, /*masked=*/false);
+        qk_softmax(qk_acv_, n_heads_);
+        qkv_attn_matmul(qk_acv_, v, qkv_acv_, n_heads_);
+    }
+
+    return qkv_acv_;
+}
+
+ResidualAttnBlock::ResidualAttnBlock(int n_attn_heads, int d_embed, int d_mlp, int max_ctx, bool mask_attn)
+    : attn_ln{LayerNorm(max_ctx, d_embed)},
+      attn{MultiHeadSelfAttn(n_attn_heads, d_embed, max_ctx, mask_attn, /*cache_v_ctx=*/mask_attn)},
+      inp_res{Residual(max_ctx, d_embed)},
+      mlp_ln{LayerNorm(max_ctx, d_embed)},
+      mlp_fc{Linear(d_embed, d_mlp, max_ctx, /*cache_acv=*/true)},
+      gelu{GELU(max_ctx, d_mlp, /*cache_ctx_acv=*/true)},
+      mlp_proj{Linear(d_mlp, d_embed, max_ctx, /*cache_acv=*/true)},
+      attn_res{Residual(max_ctx, d_embed)}
+{
+}
+
+Tensor ResidualAttnBlock::forward(const Tensor &inp)
+{
+    Tensor attn_out = inp_res.forward(inp, attn.forward(attn_ln.forward(inp)));
+    Tensor out = attn_res.forward(attn_out,
+        mlp_proj.forward(gelu.forward(mlp_fc.forward(mlp_ln.forward(attn_out)))));
+    return out;
+}
+
+ResidualCrossAttnBlock::ResidualCrossAttnBlock(int attn_heads, int d_embed, int d_mlp, int max_q_ctx, int kv_ctx)
+    : attn_ln{LayerNorm(max_q_ctx, d_embed)},
+      attn{MultiHeadSelfAttn(attn_heads, d_embed, max_q_ctx, /*mask_attn=*/true, /*cache_v_ctx=*/false)},
+      attn_res{Residual(max_q_ctx, d_embed)},
+      cross_attn_ln{LayerNorm(max_q_ctx, d_embed)},
+      cross_attn{MultiHeadCrossAttn(attn_heads, d_embed, max_q_ctx, kv_ctx)},
+      cross_attn_res{Residual(max_q_ctx, d_embed)},
+      mlp_ln{LayerNorm(max_q_ctx, d_embed)},
+      mlp_fc{Linear(d_embed, d_mlp, max_q_ctx, /*cache_acv=*/true)},
+      gelu{GELU(max_q_ctx, d_mlp, /*cache_ctx_acv=*/true)},
+      mlp_proj{Linear(d_mlp, d_embed, max_q_ctx, /*cache_acv=*/true)},
+      mlp_res{Residual(max_q_ctx, d_embed)}
+{
+}
+
+Tensor ResidualCrossAttnBlock::forward(const Tensor& x, const Tensor& xa)
+{
+    Tensor out = attn_res.forward(x, attn.forward(attn_ln.forward(x)));
+    out = cross_attn_res.forward(out, cross_attn.forward(cross_attn_ln.forward(out), xa));
+    out = mlp_res.forward(out, mlp_proj.forward(gelu.forward(mlp_fc.forward(mlp_ln.forward(out)))));
+    return out;
+}
+
+Conv1d::Conv1d(int n_filters, int in_channels, int in_frames, int strides)
+    : weight{Tensor({n_filters, in_channels*3}, kFloat16)},  // 3 is the filtersize.
+      bias{Tensor({n_filters}, kFloat16)},
+      strides_{strides}
+{
+    const int out_frames = in_frames / strides_;
+    if (strides_ == 1) {
+        acv_ = Tensor({n_filters, out_frames}, kFloat16);
+    } else {
+        acv_ = Tensor({out_frames, n_filters}, kFloat16);
+    }
+
+    const int out_channels = in_channels*filtersize_;
+    im2col_out_ = Tensor({out_frames, out_channels}, kFloat16);
+}
+
+
+Tensor Conv1d::forward(const Tensor& inp)
+{
+    Timer timer{&exec_time_ms_};
+    // Pad and im2col [out_frames, inp_channels*filter_size].
+    // Set im2col out data to zeros so that padded areas are set to zero by default.
+    void* im2col_out_data = im2col_out_.data_ptr<void>();
+    std::memset(im2col_out_data, 0, im2col_out_.nbytes());
+
+    Tensor im2col = (strides_ == 1) ? im2col_stride1(inp) : im2col_stride2(inp);
+
+    // matmul.
+    const Float16* im2col_data = im2col.data_ptr<Float16>();
+    const Float16* weight_data = weight.data_ptr<Float16>();
+    const Float16* bias_data = bias.data_ptr<Float16>();
+    Float16* acv_data = acv_.data_ptr<Float16>();
+
+    // weight: [(n_filters, in_channels*filter_size)]
+    // bias: n_filters
+    const int n_filters = weight.size(0);     // 384
+    const int filter_dimsize = weight.size(1);// 384*3
+    const int out_frames = im2col.size(0);    // 1500
+
+    for (int i = 0; i < n_filters; i++) {
+        for (int j = 0; j < out_frames; j++) {
+            Vec_f32x8 dot_prod_accum = vec_f32x8_setzero();
+            for (int k = 0; k < filter_dimsize; k += 8) {
+                Vec_f32x8 w = vec_f32x8_load(weight_data + i*filter_dimsize + k);
+                Vec_f32x8 x = vec_f32x8_load(im2col_data + j*filter_dimsize + k);
+                dot_prod_accum = vec_f32x8_fma(w, x, dot_prod_accum);
+            }
+            Float32 dot_prod = vec_f32x8_sum(dot_prod_accum) + fpcvt_to_fp32(bias_data[i]);
+
+            const int acv_idx = (strides_ == 1) ? i*out_frames + j : j*n_filters + i;
+            acv_data[acv_idx] = fpcvt_from_fp32<Float16>(dot_prod);
+        }
+    }
+
+    return acv_;
+}
+
+// Assumes out_chs > 2
+Tensor Conv1d::im2col_stride1(const Tensor& inp)
+{
+    const int inp_chs = inp.size(0);
+    const int inp_frames = inp.size(1);
+    const int out_chs = inp_chs*filtersize_;
+    const int out_frames = inp_frames;
+
+    const Float32* inp_data = inp.data_ptr<Float32>();
+    Float16* out_data = im2col_out_.data_ptr<Float16>();
+
+    // filter size accounting for padded 0.
+    const int pad_filtersize = filtersize_ - 1;
+    // Rearrange the first window accounting for zero-padding.
+    for (int i = 0; i < inp_chs; i++) {
+        for (int j = 0; j < pad_filtersize; j++) {
+            const int inp_idx = i*inp_frames + j;
+            const int out_idx = i*filtersize_ + j + 1;
+            out_data[out_idx] = fpcvt_from_fp32<Float16>(inp_data[inp_idx]);
+        }
+    }
+    
+    // Number of output frames left after subtracting two padded rows.
+    const int middle_frames = out_frames - 2;
+    // offset the first padded row that we just computed above.
+    const int out_row_offset = out_chs;
+    // Rearrange the middle windows which are not padded.
+    for (int i = 0; i < middle_frames; i++) {
+        for (int j = 0; j < inp_chs; j++) {
+            for (int k = 0; k < filtersize_; k++) {
+                const int inp_idx = i + j*inp_frames + k;
+                const int out_idx = out_row_offset + i*out_chs + j*filtersize_ + k;
+                out_data[out_idx] = fpcvt_from_fp32<Float16>(inp_data[inp_idx]); 
+            }   
+        }
+    }
+    
+    // Offset to the start of the final filter position on the input.
+    const int inp_row_offset = inp_frames + 2 - filtersize_ - 1;
+    // Offset to the start of the last row of the output.
+    const int out_offset = (out_frames - 1) * out_chs;
+    // Rearrange the last window accounting for zero-padding.
+    for (int i = 0; i < inp_chs; i++){
+        for (int j = 0; j < pad_filtersize; j++){
+            const int inp_idx = inp_row_offset + i*inp_frames + j;
+            const int out_idx = out_offset + i*filtersize_ + j;
+            out_data[out_idx] = fpcvt_from_fp32<Float16>(inp_data[inp_idx]);
+        }   
+    }
+    
+    return im2col_out_;
+}
+
+// Assume out_chs > 2.
+Tensor Conv1d::im2col_stride2(const Tensor& inp)
+{
+    const int inp_chs = inp.size(0);
+    const int inp_frames = inp.size(1);
+    const int out_chs = inp_chs * filtersize_;
+    const int out_frames = inp_frames / 2;
+
+    const Float16* inp_data = inp.data_ptr<Float16>();
+    Float16* out_data = im2col_out_.data_ptr<Float16>();
+    
+    // filter size accounting for padded 0.
+    const int pad_filtersize = filtersize_ - 1;
+    // filter size accounting for padded 0.
+    for (int i = 0; i < inp_chs; i++) {
+        for (int j = 0; j < pad_filtersize; j++) {
+            const int inp_idx = i*inp_frames + j;
+            const int out_idx = i*filtersize_ + j + 1;
+            out_data[out_idx] = inp_data[inp_idx];
+        }
+    }
+
+    // Number of output frames left after subtracting the padded row.
+    const int middle_frames = out_frames - 1;
+    // offset the first padded row that we just computed above.
+    const int out_row_offset = out_chs;
+    // Rearrange the middle windows which are not padded. The last window is not handled
+    // because it is skipped when strides=2.
+    for (int i = 0; i < middle_frames; i++) {
+        for (int j = 0; j < inp_chs; j++) {
+            for (int k = 0; k < filtersize_; k++) {
+                const int inp_idx = i+i+1 + j*inp_frames + k;
+                const int out_idx = out_row_offset + i*out_chs + j*filtersize_ + k;
+                out_data[out_idx] = inp_data[inp_idx];
+            }   
+        }
+    }
+    
+    return im2col_out_;
 }
 
 } // namespace gten

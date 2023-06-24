@@ -1,3 +1,4 @@
 models/
 private/
-gpt2
+gpt2/gpt2
+whisper/whisper

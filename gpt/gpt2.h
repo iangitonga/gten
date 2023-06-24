@@ -1,4 +1,4 @@
-#include "modules.h"
+#include "gten.h"
 #include "tokenizer.h"
 
 
@@ -81,28 +81,28 @@ struct GPT2Config
     }
 };
 
-
 class GPT2
 {
 public:
-    gten::GPT2Tokenizer tokenizer;
+    gten::GPT2Tokenizer tokenizer_;
 
-    GPT2(const InferenceOptions& inference_opts, bool show_load_info);
+    GPT2(const GPT2Config& config, int max_ctx, gten::GPT2Tokenizer&& tokenizer);
     gten::Tensor logits(const gten::Tensor &inp);
     void show_performance(int64_t niter) const;
     void sample(const InferenceOptions& opts);
     void greedy_sample(const InferenceOptions& opts);
+    void reset_acv_caches();
 
-private:
-    const int64_t magic_number_ = 0x454c49464e455447;
+public:
     GPT2Config config_;
     gten::Embedding wte_;
     gten::PosEmbedding wpe_;
-    std::vector<gten::ResidualAttentionBlock> blocks_;
+    std::vector<gten::ResidualAttnBlock> blocks_;
     gten::LayerNorm ln_f_;
     gten::Residual res_;
     int64_t time_sample_ms_ = 0;
     int64_t time_load_ms_ = 0;
-    
-    void load_from_file(const InferenceOptions& inference_opts, bool show_load_info);
 };
+
+
+GPT2* load_gpt(const InferenceOptions &inference_opts, bool show_load_info);

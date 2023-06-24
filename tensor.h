@@ -12,45 +12,17 @@
 namespace gten
 {
 
-class TensorMemoryPool {
-public:
-    TensorMemoryPool(int64_t memsize) {
-        memptr_ = reinterpret_cast<uint8_t*>(std::malloc(memsize));
-        GTEN_ASSERT(memptr_, "Failed to allocate %ld bytes of memory.", memsize);
-        mem_capacity_ = memsize;
-        std::printf("Allocated %ldMB of memory.\n", memsize / 1000000);
-    }
-
-    void* request_mem(int64_t size) {
-        GTEN_ASSERT(
-            size <= mem_capacity_ - allocated_mem_,
-            "Memory pool failed to allocate %ld bytes of memory. cap=%ld, alloc=%ld, Rem=%ld.",
-            size, mem_capacity_, allocated_mem_, mem_capacity_ - allocated_mem_);
-        void* mem = reinterpret_cast<void*>(memptr_ + allocated_mem_);
-        allocated_mem_ += size;
-        return mem;
-    }
-
-private:
-    int64_t mem_capacity_;
-    int64_t allocated_mem_{0}; 
-    uint8_t* memptr_;
-};
-
-
-class Tensor
-{
+class Tensor {
 public:
     Tensor() = default;
 
-    // Construct a tensor with data the given shape and dtype. Memory pool acts as the
-    // allocator for the tensor storage.
-    Tensor(TensorMemoryPool& pool, std::initializer_list<int> shape, Dtype dtype);
+    // Construct a tensor with uninitialized data of the given shape and dtype.
+    Tensor(std::initializer_list<int> shape, Dtype dtype);
 
     // Construct a tensor from an external data source. The constructed tensor does not take
     // ownership of the memory referenced by the pointer.
     Tensor(void* data_ptr, std::initializer_list<int> shape, Dtype dtype);
-
+ 
     // Copy-construct tensor from source tensor. Data from source tensor is shared with
     // the new tensor and thus data itself is not copied from source.
     Tensor(const Tensor& rhs) = default;
@@ -64,18 +36,16 @@ public:
 
     // Move-assign a tensor from source tensor.
     Tensor &operator=(Tensor&& rhs) = default;
-
-    ~Tensor() = default;
     
     // Get the pointer to internal data buffer.
     template <typename T>
     T* data_ptr() { 
-        return static_cast<T*>(data_); 
+        return reinterpret_cast<T*>(data_.get()); 
     }
 
     template <typename T>
     const T* data_ptr() const { 
-        return static_cast<const T*>(data_); 
+        return reinterpret_cast<const T*>(data_.get()); 
     }
 
     Dtype dtype() const noexcept {
@@ -85,14 +55,6 @@ public:
     // Get the number of bytes that an element in the tensor occupies.
     size_t itemsize() const noexcept {
         return (dtype_ == kFloat16) ? 2 : 4;
-    }
-
-    bool is_1d() const noexcept {
-        return ndims_ == 1;
-    }
-
-    bool is_2d() const noexcept {
-        return ndims_ == 2;
     }
 
     int32_t ndims() const noexcept {
@@ -114,6 +76,8 @@ public:
     friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor);
     void print() const noexcept;
 
+    void print_info() const noexcept;
+
     /// Returns the size of the give dimension.
     int32_t size(int32_t i) const;
 
@@ -124,12 +88,15 @@ public:
     }
 
 private:
-    // Pointer to tensor data storage.
-    void* data_{nullptr};
-    // Capacity of the data pointer allocated storage.
+    // shared ptr allows us to share the same data across many tensors.
+    std::shared_ptr<uint8_t[]> data_;
+
+    // Capacity of the data pointer allocated storage, in bytes.
     size_t storage_capacity_{0};
+
     // Number of elements in the tensor.
     int32_t numel_{0};
+
     // Number of tensor dimensions.
     int32_t ndims_{0};
     int32_t shape_[3]{0, 0, 0};

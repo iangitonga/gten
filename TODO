@@ -2,3 +2,5 @@ A list of features to be added.
 
 - Testing.
 - Allow generation of arbitrary-length documents.
+- Fix edge prediction bug.
+- Utilise multithreading and cache blocking.
