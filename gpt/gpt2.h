@@ -5,7 +5,7 @@
 struct InferenceOptions {
     std::string model_name {"Gpt2-medium"};
     std::string prompt {""};
-    int gen_tokens {200}; // number of tokens to generate.
+    int gen_tokens {500}; // number of tokens to generate.
     float temp {0.9f};
     bool debug_mode {false};
     bool greedy {false};

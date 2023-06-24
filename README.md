@@ -10,7 +10,9 @@ cd gten/gpt/
 g++ -std=c++17 -O3 -I../ -ffast-math gpt2.cpp -o gpt2
 ./gpt2 -p "Once upon a time" or ./gpt2 for a chat-interface.
 
-If you have an Intel CPU that supports AVX and f16c compile with the following command to achieve ~4x performance:
+If you have an Intel CPU that supports AVX and f16c compile with the following
+ command to achieve ~4x performance:
+ 
 g++ -std=c++17 -O3 -I../ -ffast-math -mavx -mf16c gpt2.cpp -o gpt2
 ```
 
