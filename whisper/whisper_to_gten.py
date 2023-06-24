@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import urllib
+import warnings
 import os
 from dataclasses import dataclass 
 
@@ -280,7 +281,7 @@ def download_model(url: str, root: str) -> str:
 
 def convert_model(model_name, model_path):
     if not model_path:
-        model_path = download_model(MODELS_URLS[model_name], "")
+        model_path = download_model(MODELS_URLS[model_name], "downloaded")
     print(f"Converting: {model_path}")
 
     with open(model_path, "rb") as fp:
@@ -289,7 +290,8 @@ def convert_model(model_name, model_path):
     model = Whisper(ModelDimensions(**checkpoint["dims"]))
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
-    with open(f"whisper.{model_name}.gten", "wb") as f:
+    os.makedirs("converted", exist_ok=True)
+    with open(f"converted/whisper.{model_name}.gten", "wb") as f:
         f.write(int_to_bytes(GTEN_MAGIC_NUMBER, width=8))
         dims = checkpoint["dims"]
         write_config(f, dims)

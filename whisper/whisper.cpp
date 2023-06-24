@@ -324,13 +324,14 @@ int main(int argc, const char *argv[])
     std::string dl_command = std::string("python3 model_dl.py ") + model_name;
 #endif
 
-    int res = std::system(dl_command.c_str());
+    const int res = std::system(dl_command.c_str());
     if (res != 0) {
         std::cout << "Error: Failed to download " << model_name << " model due to network issues.\n";
         return -1;
     }
 
-    std::ifstream fin{"models/whisper.tiny.en.gten", std::ios::binary};
+    const std::string model_path = "models/whisper." + model_name + ".en.gten";
+    std::ifstream fin{model_path, std::ios::binary};
     GTEN_ASSERT(fin.is_open(), "model file is missing.");
 
     int64_t magic;

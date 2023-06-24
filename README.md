@@ -19,7 +19,7 @@ g++ -std=c++17 -O3 -I../ -ffast-math -mavx -mf16c gpt2.cpp -o gpt2
 git clone https://github.com/iangitonga/gten.git
 cd gten/whisper/
 g++ -std=c++17 -O3 -I../ -ffast-math whisper.cpp -o whisper
-./gpt2 assets/Elon.wav
+./whisper assets/Elon.wav
 
 If you have an Intel CPU that supports AVX and f16c compile with:
 g++ -std=c++17 -O3 -I../ -ffast-math -mavx -mf16c whisper.cpp -o whisper

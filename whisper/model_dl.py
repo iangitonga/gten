@@ -6,10 +6,10 @@ from urllib import request
 
 
 MODELS_URLS = {
-    "tiny": "https://huggingface.co/iangitonga/gten/",
-    "base": "https://huggingface.co/iangitonga/gten/",
-    "small": "https://huggingface.co/iangitonga/gten/",
-    "medium": "https://huggingface.co/iangitonga/gten/"
+    "tiny": "https://huggingface.co/iangitonga/gten/resolve/main/whisper.tiny.en.gten",
+    "base": "https://huggingface.co/iangitonga/gten/resolve/main/whisper.base.en.gten",
+    "small": "https://huggingface.co/iangitonga/gten/resolve/main/whisper.small.en.gten",
+    "medium": "https://huggingface.co/iangitonga/gten/resolve/main/whisper.medium.en.gten"
 }
 
 
